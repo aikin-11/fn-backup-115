@@ -5,8 +5,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./config:/config
-      - ./backups:/backups
-      # 将飞牛上的源目录映射到容器内，例如 /share/Media:/data/Media:ro
-      - /share:/data:ro
+      - /vol1/1000/存储空间1/docker/115/config:/config
+      - /vol3/1000/存储空间3/备份:/backups
+      - /vol3/1000/存储空间3/备份/照片:/data/照片:ro
     restart: unless-stopped
