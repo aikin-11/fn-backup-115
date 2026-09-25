@@ -1,4 +1,4 @@
-import base64, hashlib, http.client, json, os, posixpath, secrets, shutil, sqlite3, subprocess, tarfile, threading, time, urllib.parse
+import base64, http.client, json, os, secrets, sqlite3, subprocess, tarfile, threading, time, urllib.parse
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -6,6 +6,7 @@ ROOT=os.environ.get('CONFIG_DIR','/config'); DB=os.path.join(ROOT,'backup.db'); 
 os.makedirs(ROOT,exist_ok=True); os.makedirs(STORE,exist_ok=True)
 DEFAULT={'source':'/data','remote_url':'','remote_path':'/115-backups','username':'','password':'','encryption_password':'','schedule':'02:00','enabled':False,'keep_local':False}
 lock=threading.Lock()
+PART_BYTES=1024*1024*1024
 
 def load():
     try:
@@ -33,7 +34,50 @@ def dav_put(url, local, user, password):
     if r.status not in (200,201,204): raise RuntimeError('WebDAV 上传失败: HTTP %s %s'%(r.status,data.decode(errors='ignore')))
 def remote_url(c,name): return c['remote_url'].rstrip('/')+'/'+c['remote_path'].strip('/')+'/'+urllib.parse.quote(name)
 
+class ChunkWriter:
+    def __init__(self,prefix): self.prefix=prefix; self.parts=[]; self.file=None; self.size=0
+    def write(self,data):
+        data=memoryview(data); total=len(data)
+        while data:
+            if self.file is None or self.size==PART_BYTES:
+                if self.file: self.file.close()
+                path=f'{self.prefix}.part{len(self.parts):04d}'
+                self.file=open(path,'wb'); self.parts.append(path); self.size=0
+            count=min(len(data),PART_BYTES-self.size)
+            self.file.write(data[:count]); self.size+=count; data=data[count:]
+        return total
+    def flush(self):
+        if self.file: self.file.flush()
+    def close(self):
+        if self.file: self.file.close(); self.file=None
+
+def make_parts(changed,prefix,password):
+    writer=ChunkWriter(prefix); errors=[]
+    if password:
+        env={**os.environ,'BACKUP_PASSPHRASE':password}
+        proc=subprocess.Popen(['openssl','enc','-aes-256-cbc','-pbkdf2','-iter','200000','-salt','-pass','env:BACKUP_PASSPHRASE'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
+        def collect():
+            try:
+                while block:=proc.stdout.read(1024*1024): writer.write(block)
+            except Exception as e: errors.append(e)
+            finally: writer.close()
+        reader=threading.Thread(target=collect); reader.start()
+        try:
+            with tarfile.open(fileobj=proc.stdin,mode='w|gz') as archive:
+                for path,rel in changed: archive.add(path,arcname=rel,recursive=False)
+        finally: proc.stdin.close()
+        reader.join(); code=proc.wait(); detail=proc.stderr.read().decode(errors='replace')
+        if errors: raise errors[0]
+        if code: raise RuntimeError('加密失败: '+detail)
+    else:
+        try:
+            with tarfile.open(fileobj=writer,mode='w|gz') as archive:
+                for path,rel in changed: archive.add(path,arcname=rel,recursive=False)
+        finally: writer.close()
+    return writer.parts
+
 def backup():
+    if not lock.acquire(blocking=False): return
     c=load(); source=c['source']; rid=log_run('running',kind='full' if not os.path.exists(os.path.join(STORE,'manifest.json')) else 'incremental')
     try:
         if not os.path.isdir(source): raise RuntimeError('源目录不存在: '+source)
@@ -50,18 +94,19 @@ def backup():
                 if old.get(rel)!=sig: changed.append((p,rel))
         if not old: changed=[(os.path.join(source,r),r) for r in current]
         if not changed: log_run('success','没有检测到变更','',rid=rid); return
-        kind='full' if not old else 'incremental'; stamp=datetime.now().strftime('%Y%m%d-%H%M%S'); name=f'{kind}-{stamp}.tar.gz'; archive=os.path.join(STORE,name)
-        with tarfile.open(archive,'w:gz') as t:
-            for p,rel in changed: t.add(p,arcname=rel,recursive=False)
-        final=archive
-        if c['encryption_password']:
-            enc=archive+'.enc'; subprocess.run(['openssl','enc','-aes-256-cbc','-pbkdf2','-iter','200000','-salt','-in',archive,'-out',enc,'-pass','pass:'+c['encryption_password']],check=True); os.remove(archive); final=enc; name=os.path.basename(enc)
+        kind='full' if not old else 'incremental'; stamp=datetime.now().strftime('%Y%m%d-%H%M%S'); token=secrets.token_hex(3)
+        name=f'{kind}-{stamp}-{token}.tar.gz'+('.enc' if c['encryption_password'] else '')
+        parts=make_parts(changed,os.path.join(STORE,name),c['encryption_password'])
         if c['remote_url']:
-            dav_put(remote_url(c,name),final,c['username'],c['password'])
-        with open(manifest_path,'w') as f: json.dump(current,f)
-        if c['remote_url'] and not c['keep_local']: os.remove(final)
-        log_run('success',f'完成：{len(changed)} 个文件',name,rid=rid)
+            for part in parts: dav_put(remote_url(c,os.path.basename(part)),part,c['username'],c['password'])
+        tmp=manifest_path+'.tmp'
+        with open(tmp,'w') as f: json.dump(current,f)
+        os.replace(tmp,manifest_path)
+        if c['remote_url'] and not c['keep_local']:
+            for part in parts: os.remove(part)
+        log_run('success',f'完成：{len(changed)} 个文件，{len(parts)} 个分卷',name,rid=rid)
     except Exception as e: log_run('failed',str(e),rid=rid)
+    finally: lock.release()
 
 def scheduler():
     last=''
