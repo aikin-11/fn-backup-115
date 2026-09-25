@@ -6,6 +6,12 @@ services:
       - "1124:8080"
     volumes:
       - /vol1/1000/存储空间1/docker/115/config:/config
-      - /vol3/1000/存储空间3/备份:/backups
+      - /vol1/1000/存储空间1/docker/115/archives:/backups
       - /vol3/1000/存储空间3/备份/照片:/data/照片:ro
+      - /vol1:/sources/vol1:ro
+      - /vol2:/sources/vol2:ro
+      - /vol3:/sources/vol3:ro
+    environment:
+      SOURCE_ROOTS: /sources/vol1:/sources/vol2:/sources/vol3:/data
+      EXCLUDE_PATHS: /sources/vol1/1000/存储空间1/docker/115
     restart: unless-stopped

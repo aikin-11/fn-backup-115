@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>飞牛 115 · 独立 ZIP 备份</title>
+<style>
+body{font:15px system-ui;background:#f3f6fa;color:#182638;margin:0}main{max-width:1060px;margin:32px auto;padding:28px;background:white;border-radius:16px}h1{margin:0 0 12px}h2{font-size:20px;margin-top:28px}p,.hint{color:#58687b;line-height:1.7}label{display:block;margin:12px 0}input,select{display:block;width:100%;padding:10px;box-sizing:border-box;border:1px solid #bbc8da;border-radius:6px;margin-top:5px;font:inherit}input[type=checkbox]{display:inline;width:auto}button{font:inherit;padding:10px 16px;border:0;border-radius:7px;background:#2265d7;color:white;cursor:pointer;margin:4px 4px 4px 0}.secondary{background:#e8eef7;color:#234}.danger{background:#a33}button:disabled{opacity:.5;cursor:wait}.grid{display:grid;grid-template-columns:1fr 1fr;gap:0 20px}#notice{white-space:pre-wrap;color:#14532d;position:sticky;top:0;background:#edfff4;padding:12px;border-radius:7px}#live{padding:16px;background:#eef4ff;border-radius:8px;line-height:1.7}#logs{max-height:300px;overflow:auto;background:#122036;color:#d5e5f7;white-space:pre-wrap;padding:16px;word-break:break-all}table{border-collapse:collapse;width:100%;font-size:13px}td,th{text-align:left;padding:10px;border-bottom:1px solid #e3e8ef;overflow-wrap:anywhere}dialog{width:min(650px,85vw);border:1px solid #ccd;border-radius:12px}#folders{max-height:40vh;overflow:auto}#folders button{display:block;background:#edf3fb;color:#123;width:100%;text-align:left}#folderPath{overflow-wrap:anywhere}small{color:#62738a}progress{width:100%}@media(max-width:700px){main{margin:8px;padding:16px}.grid{grid-template-columns:1fr}}
+</style><main>
+<h1>飞牛 115 · 独立 ZIP 备份</h1>
+<p>每包约 1 GiB 原始文件，独立 AES-256 加密 ZIP。每个 ZIP 都可单独下载，用支持 AES ZIP 的解压软件输入密码解压；无需拼接。大于 1 GiB 的单个文件独立成包。</p>
+<div id="notice" role="status">正在读取配置…</div>
+<form id="settings">
+<h2>备份位置</h2><label>源目录<input name="source" id="source" required></label>
+<button type="button" class="secondary" id="browse">浏览 NAS 目录</button>
+<small>只读挂载：/sources/vol1、/sources/vol2、/sources/vol3 对应 NAS 存储卷；/data/照片 为原照片目录。</small>
+<div class="grid"><label>WebDAV 地址<input name="remote_url" type="url" required></label><label>115 目标目录<input name="remote_path" required></label><label>WebDAV 用户名<input name="username" autocomplete="off"></label><label>WebDAV 密码（留空保留原值）<input name="password" type="password" autocomplete="new-password"></label></div>
+<h2>ZIP 加密与排序</h2>
+<label>压缩格式<select name="format"><option value="zip">ZIP · AES-256 加密 · 独立压缩包</option></select></label>
+<div class="grid"><label>ZIP 加密密码（至少 8 位，留空保留已验证密码）<input name="encryption_password" type="password" autocomplete="new-password"></label><label>再次输入 ZIP 加密密码<input name="encryption_password_confirm" type="password" autocomplete="new-password"></label></div>
+<p id="passwordState"></p><p>保存时测试加密和解密，打包后逐文件解密并核对 SHA-256。请将密码保存在密码管理器；验证不能替你记住密码。ZIP 内容加密，但文件名可见。更换密码仅影响新包。</p>
+<label>日期排序<select disabled><option>从旧到新：EXIF 拍摄/生成时间 → 文件创建时间 → 修改时间</option></select></label>
+<p>无可读 EXIF 或创建时间时使用修改时间，日志会统计回退数量。复制过的照片优先使用照片内的原始日期；HEIC 等不支持读取的格式会回退。每个包保留原目录结构。</p>
+<h2>定时与增量</h2><div class="grid"><label>扫描间隔（分钟）<input name="interval_minutes" type="number" min="1" max="10080" required></label><label>新增/变更达到多少 GiB 时自动备份<input name="threshold_gib" type="number" min="0" max="1024" step="0.01" required></label></div>
+<label><input type="checkbox" name="enabled"> 启用定时扫描</label><label><input type="checkbox" name="keep_local"> 上传后保留本地 ZIP</label>
+<p>首次备份连续生成所有独立 ZIP，最后不足 1 GiB 也打包。手动备份不受增量阈值限制；自动扫描默认累计 1 GiB。设为 0 可取消自动备份的大小门槛。</p>
+<button type="submit">保存并验证密码</button><button type="button" id="run">立即备份已保存目录</button><button type="button" id="stop" class="danger">停止当前任务</button>
+</form>
+<details><summary>检查是否记得已保存的 ZIP 密码</summary><label>重新输入密码<input id="rememberPassword" type="password" autocomplete="off"></label><button id="verify" class="secondary">验证密码</button></details>
+<h2>实时进度</h2><div id="live">待运行</div><h2>任务日志</h2><pre id="logs">暂无日志</pre>
+<h2>最近任务</h2><button id="clear" class="secondary">清空任务记录（保留备份文件）</button><table><thead><tr><th>开始</th><th>状态</th><th>信息</th><th>归档</th></tr></thead><tbody id="runs"></tbody></table>
+<p>恢复：单独下载任意 .zip，使用 7-Zip 等支持 AES ZIP 的软件解压。完整恢复需收集全部成功的全量和增量 ZIP，按包名时间从旧到新解压到一个空目录；新版本覆盖旧版本。此备份不传播源目录的删除操作。</p>
+</main><dialog id="picker"><h2>选择 NAS 备份目录</h2><p id="folderPath"></p><button id="up" class="secondary">上一级</button><div id="folders"></div><button id="choose">选择当前目录</button><button id="close" class="secondary">关闭</button></dialog>
+<script>
+const token='__CSRF__',form=document.getElementById('settings'),notice=document.getElementById('notice');let current='',parent='',dirty=false;
+function say(t,error=false){notice.textContent=t;notice.style.color=error?'#a22':'#14532d'}
+async function api(path,data){const r=await fetch(path,data===undefined?{cache:'no-store'}:{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':token},body:JSON.stringify(data)});const x=await r.json();if(!r.ok)throw Error(x.error||r.status);return x}
+function bind(id,fn){document.getElementById(id).onclick=async()=>{try{await fn()}catch(e){say(e.message,true)}}}
+async function config(){const c=await api('/config');for(const [key,value] of Object.entries(c)){const input=form.elements.namedItem(key);if(input){if(input.type==='checkbox')input.checked=!!value;else input.value=value}}document.getElementById('passwordState').textContent=c.password_verified?'已完成密码验证；可以备份。':'升级后需要重新输入两遍 ZIP 密码完成验证。';say(c.password_verified?'配置已读取。':'请选择源目录，并输入两遍 ZIP 密码后保存。旧版任务已停止。')}
+form.oninput=()=>dirty=true;
+form.onsubmit=async e=>{e.preventDefault();try{const data=Object.fromEntries(new FormData(form));data.enabled=form.elements.enabled.checked;data.keep_local=form.elements.keep_local.checked;await api('/save',data);form.elements.encryption_password.value='';form.elements.encryption_password_confirm.value='';form.elements.password.value='';dirty=false;await config();say('配置已保存，ZIP 加密和解密验证通过。')}catch(e){say(e.message,true)}};
+bind('run',async()=>{if(dirty)throw Error('配置尚未保存，请先保存并验证密码');await api('/run',{});say('备份已启动');await poll()});
+bind('stop',async()=>{await api('/stop',{});say('已请求停止，正在结束当前操作');await poll()});
+bind('clear',async()=>{await api('/clear-history',{});say('任务记录已清空，归档和增量状态保留');await poll()});
+bind('verify',async()=>{const p=document.getElementById('rememberPassword');await api('/verify-password',{password:p.value});p.value='';say('密码正确，加密与解密验证通过。')});
+async function browse(path=''){const x=await api('/browse?path='+encodeURIComponent(path));current=x.path;parent=x.parent;document.getElementById('folderPath').textContent=current||'存储卷';const list=document.getElementById('folders');list.replaceChildren();for(const p of x.directories){const b=document.createElement('button');b.textContent='📁 '+p.split('/').pop();b.onclick=()=>browse(p).catch(e=>say(e.message,true));list.appendChild(b)}document.getElementById('choose').disabled=!current}
+bind('browse',async()=>{await browse();document.getElementById('picker').showModal()});bind('up',()=>browse(parent));bind('choose',()=>{document.getElementById('source').value=current;dirty=true;document.getElementById('picker').close()});bind('close',()=>document.getElementById('picker').close());
+const status={success:'成功',running:'运行中',waiting:'等待累计',failed:'失败',interrupted:'已中断',cancelled:'已停止'};
+async function poll(){try{const x=await api('/progress');document.getElementById('run').disabled=x.running;document.getElementById('clear').disabled=x.running;const latest=x.runs[0];document.getElementById('live').textContent=latest?(status[latest.status]||latest.status)+'：'+latest.message:'暂无任务';const rows=document.getElementById('runs');rows.replaceChildren();for(const r of x.runs){const tr=document.createElement('tr');for(const t of [r.started,status[r.status]||r.status,r.message,r.archive]){const td=document.createElement('td');td.textContent=t||'';tr.appendChild(td)}rows.appendChild(tr)}document.getElementById('logs').textContent=x.logs.map(l=>l.at+' '+l.message).join('\n')||'暂无日志'}catch(e){document.getElementById('live').textContent='状态读取失败：'+e.message}}
+config().catch(e=>say(e.message,true));poll();setInterval(poll,2500);
+</script></html>
