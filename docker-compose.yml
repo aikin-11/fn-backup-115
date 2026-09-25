@@ -3,7 +3,7 @@ services:
     build: .
     container_name: fn-backup-115
     ports:
-      - "8080:8080"
+      - "1124:8080"
     volumes:
       - /vol1/1000/存储空间1/docker/115/config:/config
       - /vol3/1000/存储空间3/备份:/backups
