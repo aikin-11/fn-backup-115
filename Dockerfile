@@ -1,4 +1,4 @@
-FROM registry.cn-hangzhou.aliyuncs.com/library/python:3.12-alpine
+FROM docker.m.daocloud.io/library/python:3.12-alpine
 RUN apk add --no-cache tar openssl tzdata
 WORKDIR /app
 COPY . /app
