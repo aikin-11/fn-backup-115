@@ -72,6 +72,18 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(state['packages'][0]['name'],oldname)
         self.assertEqual(len(state['files']),1)
 
+    def test_upload_reports_early_webdav_rejection_instead_of_broken_pipe(self):
+        archive=root/'archives'/'early-reject.zip';archive.write_bytes(b'zip-data')
+        conn=unittest.mock.Mock()
+        conn.send.side_effect=BrokenPipeError('peer closed')
+        response=unittest.mock.Mock(status=413,reason='Content Too Large')
+        response.read.return_value=b'upload exceeds server limit'
+        conn.getresponse.return_value=response
+        c={**app.DEFAULT,'remote_url':'http://localhost:1999','remote_path':'/115/backup','username':'backup','password':'secret'}
+        with patch.object(app.http.client,'HTTPConnection',return_value=conn):
+            with self.assertRaisesRegex(RuntimeError,'HTTP 413 Content Too Large.*server limit'):
+                app.upload(c,str(archive),self.rid)
+
     def test_source_isolation_and_traversal(self):
         with self.assertRaises(ValueError):app.source_path('/etc')
         a={**app.DEFAULT,'source':str(root/'source')};b={**a,'source':str(root/'source'/'resume')}
