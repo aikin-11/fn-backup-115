@@ -7,6 +7,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pyzipper
 from PIL import Image
 
+# The scanner only reads image headers and EXIF; it never decodes pixel data.
+# Some NAS photos exceed Pillow's default pixel limit, so that limit would abort
+# metadata-only scans despite no large image buffer being allocated.
+Image.MAX_IMAGE_PIXELS = None
+
 ROOT = os.environ.get('CONFIG_DIR', '/config')
 STORE = os.environ.get('BACKUP_DIR', '/backups')
 CFG = os.path.join(ROOT, 'config.json')
@@ -91,8 +96,11 @@ def photo_time(path, st):
         except (OSError, ValueError, subprocess.SubprocessError): birth = 0
     return (birth, '创建时间') if birth > 0 else (st.st_mtime, '修改时间回退')
 
-def scan(source, old, rid):
+def scan(source, old, rid, cache=None, save_cache=None):
+    cache = cache if cache is not None else {}
+    save_cache = save_cache or (lambda value: None)
     found, count, skipped, kinds = [], 0, 0, {}
+    cache_dirty, last_report = 0, time.monotonic()
     def walk_error(e): raise e
     for base, dirs, files in os.walk(source, onerror=walk_error):
         check_cancel()
@@ -101,10 +109,24 @@ def scan(source, old, rid):
             check_cancel(); path = os.path.join(base, name); st = os.lstat(path)
             if not stat.S_ISREG(st.st_mode): skipped += 1; continue
             rel = os.path.relpath(path, source); count += 1
-            if old.get(rel) != signature(st):
-                ts, origin = photo_time(path, st); kinds[origin] = kinds.get(origin,0)+1
+            sig = signature(st)
+            cached = cache.get(rel)
+            if cached and cached[0] == sig:
+                ts, origin = cached[1], cached[2]
+            else:
+                ts, origin = photo_time(path, st)
+                cache[rel] = [sig, ts, origin]
+                cache_dirty += 1
+            kinds[origin] = kinds.get(origin,0)+1
+            if old.get(rel) != sig:
                 found.append(dict(path=path, rel=rel, size=st.st_size, sig=signature(st), time=ts, time_source=origin))
-            if count % 250 == 0: event(rid, f'扫描 {count} 个文件；待备份 {len(found)} 个，正在读取照片日期')
+            if cache_dirty >= 1000:
+                save_cache(cache)
+                cache_dirty = 0
+            if count % 5000 == 0 or time.monotonic() - last_report >= 10:
+                event(rid, f'扫描目录 {count} 个文件；待备份 {len(found)} 个；照片日期索引已缓存')
+                last_report = time.monotonic()
+    save_cache(cache)
     found.sort(key=lambda x:(x['time'],x['rel']))
     event(rid, f'扫描完成：{count} 个文件，新增或修改 {len(found)} 个；日期来源 {kinds}；跳过链接/特殊文件 {skipped}')
     return found
@@ -222,7 +244,9 @@ def perform(c, manual):
         if pending:
             path=os.path.join(STORE,pending['name']); event(rid,'重试上次已生成的独立 ZIP：'+pending['name'])
             verify_zip(path,c['encryption_password'],pending['hashes'],rid); upload(c,path,rid); commit_package(state,sp,pending,c)
-        items=scan(source,state['files'],rid); total=sum(x['size'] for x in items)
+        cache = state.get('date_cache', {})
+        items=scan(source,state['files'],rid,cache,lambda value: (state.update(date_cache=value), atomic_json(sp,state)))
+        total=sum(x['size'] for x in items)
         if not items:
             state['baseline_complete']=True; atomic_json(sp,state); finish(rid,'success','扫描完成，没有待备份内容'); return
         if not full and not manual and total<float(c['threshold_gib'])*GIB:
