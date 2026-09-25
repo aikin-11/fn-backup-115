@@ -207,11 +207,23 @@ def upload(c, path, rid):
         conn.putheader('Content-Length',str(size)); conn.putheader('Authorization','Basic '+base64.b64encode((c['username']+':'+c['password']).encode()).decode())
         conn.putheader('Content-Type','application/zip'); conn.endheaders()
         sent,last=0,time.monotonic()
-        with open(path,'rb') as f:
-            while block:=f.read(BLOCK):
-                check_cancel(); conn.send(block); sent+=len(block)
-                if time.monotonic()-last>=2 or sent==size:
-                    event(rid,f'发送 ZIP 至 OpenList：{sent/BLOCK:.0f}/{size/BLOCK:.0f} MiB（{int(sent*100/max(size,1))}%）'); last=time.monotonic()
+        try:
+            with open(path,'rb') as f:
+                while block:=f.read(BLOCK):
+                    check_cancel(); conn.send(block); sent+=len(block)
+                    if time.monotonic()-last>=2 or sent==size:
+                        event(rid,f'发送 ZIP 至 OpenList：{sent/BLOCK:.0f}/{size/BLOCK:.0f} MiB（{int(sent*100/max(size,1))}%）'); last=time.monotonic()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError) as exc:
+            # A WebDAV server can reject a PUT immediately after its headers and
+            # close the socket while the request body is still being sent.
+            # Read that response when possible so logs show the actual cause.
+            try:
+                response=conn.getresponse()
+                detail=response.read(1024).decode('utf-8','replace').strip()
+                suffix=f'; {detail[:300]}' if detail else ''
+                raise RuntimeError(f'WebDAV 在接收数据时提前关闭连接：HTTP {response.status} {response.reason}{suffix}；已发送 {sent/BLOCK:.0f}/{size/BLOCK:.0f} MiB，本地 ZIP 保留') from exc
+            except (http.client.HTTPException, OSError):
+                raise RuntimeError(f'WebDAV 在接收数据时断开连接（{type(exc).__name__}: {exc}）；已发送 {sent/BLOCK:.0f}/{size/BLOCK:.0f} MiB，本地 ZIP 保留') from exc
         start_wait[0]=time.monotonic(); waiting.set()
         event(rid,'本包数据发送完毕，正在等待 OpenList/115 确认上传成功…')
         response=conn.getresponse(); check_cancel()
