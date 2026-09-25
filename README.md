@@ -1,6 +1,6 @@
 # 飞牛 NAS 115 备份容器
 
-单容器备份工具：tar.gz 压缩、增量备份、AES-256-CBC/PBKDF2 加密、定时执行、Web 配置与任务记录。115 目标通过 WebDAV 访问。
+单容器备份工具：tar.gz 压缩、增量备份、AES-256-CBC/PBKDF2 加密、定时执行、Web 配置与任务记录。115 目标通过 OpenList WebDAV 访问。
 
 ## 飞牛部署
 
@@ -13,6 +13,16 @@ docker compose up -d --build
 
 打开 `http://192.168.5.23:1124`。当前源目录映射为容器内 `/data/照片`，本地归档目录映射为 `/vol3/1000/存储空间3/备份`。更换 NAS 时需先修改 Compose 中的路径。
 
-在页面填写 WebDAV 地址、远端目录、账号和密码，再设置归档加密密码与计划时间。上传成功后是否保留本地包由页面开关控制；未配置远端时总是保留本地包。
+当前 OpenList 备份账号的基本路径是 `/115/备份`，因此应用 WebDAV URL 填 `http://192.168.5.23:1999`，远端目录填 `/dav`。
 
-首次备份为完整包，后续备份只包含新增或修改的文件。恢复时从完整包开始，按时间顺序解包增量包。当前版本不记录已删除文件的恢复操作。
+## 备份与恢复
+
+首次备份生成完整包，之后只打包新增或修改的文件。加密归档被分为不超过 1 GiB 的 `.part0000`、`.part0001` 等分卷，按编号顺序连接后才能解密与解压。
+
+```bash
+read -rsp '归档密码: ' BACKUP_PASSPHRASE; export BACKUP_PASSPHRASE; echo
+cat full-YYYYMMDD-HHMMSS-xxxxxx.tar.gz.enc.part* | openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:BACKUP_PASSPHRASE | tar -xz -C /恢复目录
+unset BACKUP_PASSPHRASE
+```
+
+先恢复完整包，再按时间顺序恢复增量包。当前版本不记录删除操作；源目录删除的文件不会自动从恢复目录删除。未配置远端时总是保留本地分卷；配置远端后，网页开关控制是否保留。
