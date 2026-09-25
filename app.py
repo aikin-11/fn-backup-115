@@ -23,6 +23,9 @@ def log_run(status,msg='',archive='',kind='incremental',rid=None):
     if rid: c.execute('update runs set finished=?,status=?,message=?,archive=? where id=?',(now,status,msg,archive,rid))
     else: rid=c.execute('insert into runs(started,status,message,archive,kind) values(?,?,?,?,?)',(now,'running','',archive,kind)).lastrowid
     c.commit(); c.close(); return rid
+def update_progress(rid,msg):
+    c=db(); c.execute('update runs set message=? where id=?',(msg,rid)); c.commit(); c.close()
+    print(msg,flush=True)
 def runs():
     c=db(); rows=c.execute('select id,started,finished,status,message,archive,kind from runs order by id desc limit 30').fetchall(); c.close(); return rows
 
@@ -54,8 +57,35 @@ class ChunkWriter:
     def close(self):
         if self.file: self.file.close(); self.file=None
 
-def make_parts(changed,prefix,password):
+class ProgressReader:
+    def __init__(self,source,callback): self.source=source; self.callback=callback; self.bytes=0
+    def read(self,size=-1):
+        data=self.source.read(size)
+        if data: self.bytes+=len(data); self.callback(self.bytes)
+        return data
+
+def make_parts(changed,prefix,password,rid,total_bytes):
     writer=ChunkWriter(prefix); errors=[]
+    done=0; total_files=len(changed)
+    last_report=[0,time.monotonic()]
+    def report(msg,force=False):
+        now=time.monotonic()
+        if force or now-last_report[1]>=2:
+            update_progress(rid,msg); last_report[:]=[0,now]
+    def add_files(archive):
+        nonlocal done
+        for index,(path,rel) in enumerate(changed,1):
+            info=archive.gettarinfo(path,arcname=rel); size=os.path.getsize(path)
+            def progress(read_bytes):
+                now=time.monotonic()
+                if read_bytes-last_report[0]>=16*1024*1024 or now-last_report[1]>=3:
+                    total=min(total_bytes,done+read_bytes); pct=int(total*100/max(total_bytes,1))
+                    report(f'正在压缩加密：{index}/{total_files} 个文件，{human_size(total)} / {human_size(total_bytes)}（{pct}%）',True)
+            if info.isfile():
+                with open(path,'rb') as source: archive.addfile(info,ProgressReader(source,progress))
+            else: archive.addfile(info)
+            done+=size
+            report(f'已处理 {index}/{total_files} 个文件，{human_size(min(done,total_bytes))} / {human_size(total_bytes)}（{int(min(done,total_bytes)*100/max(total_bytes,1))}%）',index==total_files)
     if password:
         env={**os.environ,'BACKUP_PASSPHRASE':password}
         proc=subprocess.Popen(['openssl','enc','-aes-256-cbc','-pbkdf2','-iter','200000','-salt','-pass','env:BACKUP_PASSPHRASE'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
@@ -67,7 +97,7 @@ def make_parts(changed,prefix,password):
         reader=threading.Thread(target=collect); reader.start()
         try:
             with tarfile.open(fileobj=proc.stdin,mode='w|gz') as archive:
-                for path,rel in changed: archive.add(path,arcname=rel,recursive=False)
+                add_files(archive)
         finally: proc.stdin.close()
         reader.join(); code=proc.wait(); detail=proc.stderr.read().decode(errors='replace')
         if errors: raise errors[0]
@@ -75,27 +105,32 @@ def make_parts(changed,prefix,password):
     else:
         try:
             with tarfile.open(fileobj=writer,mode='w|gz') as archive:
-                for path,rel in changed: archive.add(path,arcname=rel,recursive=False)
+                add_files(archive)
         finally: writer.close()
     return writer.parts
 
 def backup():
     if not lock.acquire(blocking=False): return
-    c=load(); source=c['source']; rid=log_run('running',kind='full' if not os.path.exists(os.path.join(STORE,'manifest.json')) else 'incremental')
+    c=load(); source=c['source']; manifest_path=os.path.join(STORE,'manifest.json'); kind='full' if not os.path.exists(manifest_path) else 'incremental'; rid=log_run('running',kind=kind)
     try:
         if not os.path.isdir(source): raise RuntimeError('源目录不存在: '+source)
-        manifest_path=os.path.join(STORE,'manifest.json'); old={}
+        old={}
         if os.path.exists(manifest_path):
             with open(manifest_path) as f: old=json.load(f)
         current={}; sizes={}
-        changed=[]
+        changed=[]; scanned=0; last_report=time.monotonic(); pending_estimate=0
+        update_progress(rid,'正在扫描源目录并统计待备份数据…')
         for base,dirs,files in os.walk(source):
             dirs.sort(); files.sort()
             for fn in files:
                 p=os.path.join(base,fn); rel=os.path.relpath(p,source); st=os.stat(p); sig=f'{st.st_size}:{st.st_mtime_ns}'
                 current[rel]=sig; sizes[rel]=st.st_size
-                if old.get(rel)!=sig: changed.append((p,rel))
-        if not old: changed=[(os.path.join(source,r),r) for r in current]
+                if not old or old.get(rel)!=sig:
+                    changed.append((p,rel)); pending_estimate+=st.st_size
+                scanned+=1
+                if scanned%1000==0 or time.monotonic()-last_report>=3:
+                    update_progress(rid,f'正在扫描：已检查 {scanned} 个文件，待备份约 {human_size(pending_estimate)}')
+                    last_report=time.monotonic()
         if not changed: log_run('success','没有检测到变更','',rid=rid); return
         pending_bytes=sum(sizes[rel] for _,rel in changed)
         if pending_bytes<PART_BYTES:
@@ -104,11 +139,14 @@ def backup():
         for item in changed:
             if batch and batch_bytes>=PART_BYTES: break
             batch.append(item); batch_bytes+=sizes[item[1]]
+        update_progress(rid,f'发现待备份 {human_size(pending_bytes)}；本轮处理 {len(batch)} 个文件，源数据 {human_size(batch_bytes)}')
         kind='full' if not old else 'incremental'; stamp=datetime.now().strftime('%Y%m%d-%H%M%S'); token=secrets.token_hex(3)
         name=f'{kind}-{stamp}-{token}.tar.gz'+('.enc' if c['encryption_password'] else '')
-        parts=make_parts(batch,os.path.join(STORE,name),c['encryption_password'])
+        parts=make_parts(batch,os.path.join(STORE,name),c['encryption_password'],rid,batch_bytes)
         if c['remote_url']:
-            for part in parts: dav_put(remote_url(c,os.path.basename(part)),part,c['username'],c['password'])
+            for index,part in enumerate(parts,1):
+                update_progress(rid,f'正在上传分卷 {index}/{len(parts)}：{os.path.getsize(part)/(1024**2):.0f} MiB')
+                dav_put(remote_url(c,os.path.basename(part)),part,c['username'],c['password'])
         updated=old.copy()
         for rel in list(updated):
             if rel not in current: updated.pop(rel)
@@ -131,15 +169,19 @@ def scheduler():
             last=key; threading.Thread(target=backup,daemon=True).start()
         time.sleep(20)
 
-HTML='''<!doctype html><meta charset="utf-8"><title>飞牛 115 备份</title><style>body{font:15px system-ui;max-width:900px;margin:30px auto;background:#f5f7fb;color:#1f2937}main{background:white;padding:26px;border-radius:14px;box-shadow:0 2px 12px #ccd}label{display:block;margin:12px 0}input{padding:9px;width:100%;box-sizing:border-box;border:1px solid #ccd;border-radius:7px}button{padding:10px 18px;border:0;border-radius:7px;background:#2563eb;color:white;cursor:pointer}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}table{width:100%;border-collapse:collapse;margin-top:20px}td,th{padding:8px;border-bottom:1px solid #eee;text-align:left}.ok{color:green}.bad{color:#b91c1c}.wait{color:#9a6700}</style><main><h1>飞牛 NAS · 115 备份</h1><p>定时扫描新增和变更内容，累计达到 1 GiB 后打包加密并上传；单个压缩加密分卷最大 1 GiB。</p><form method="post" action="/save"><label>源目录（容器内路径）<input name="source" value="{source}"></label><div class="grid"><label>115 WebDAV URL<input name="remote_url" placeholder="https://..." value="{remote_url}"></label><label>远端目录<input name="remote_path" value="{remote_path}"></label><label>WebDAV 用户名<input name="username" value="{username}"></label><label>WebDAV 密码<input type="password" name="password" value="{password}"></label><label>归档加密密码<input type="password" name="encryption_password" value="{encryption_password}"></label><label>每日执行时间<input name="schedule" pattern="[0-2][0-9]:[0-5][0-9]" value="{schedule}"></label></div><label><input style="width:auto" type="checkbox" name="enabled" {enabled}> 启用定时备份</label><label><input style="width:auto" type="checkbox" name="keep_local" {keep_local}> 上传后保留本地归档</label><button>保存配置</button> <button formaction="/run" formmethod="post">立即备份</button></form><h2>最近任务</h2><table><tr><th>开始</th><th>类型</th><th>状态</th><th>信息</th><th>归档</th></tr>{rows}</table></main>'''
+HTML='''<!doctype html><meta charset="utf-8"><title>飞牛 115 备份</title><style>body{font:15px system-ui;max-width:900px;margin:30px auto;background:#f5f7fb;color:#1f2937}main{background:white;padding:26px;border-radius:14px;box-shadow:0 2px 12px #ccd}label{display:block;margin:12px 0}input{padding:9px;width:100%;box-sizing:border-box;border:1px solid #ccd;border-radius:7px}button{padding:10px 18px;border:0;border-radius:7px;background:#2563eb;color:white;cursor:pointer}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}table{width:100%;border-collapse:collapse;margin-top:20px}td,th{padding:8px;border-bottom:1px solid #eee;text-align:left}.ok{color:green}.bad{color:#b91c1c}.wait{color:#9a6700}#live{padding:12px;background:#eef4ff;border-radius:8px;margin:12px 0}#live progress{display:block;width:100%;height:16px;margin-top:8px}</style><main><h1>飞牛 NAS · 115 备份</h1><p>定时扫描新增和变更内容，累计达到 1 GiB 后打包加密并上传；首次全量也按约 1 GiB 源数据逐包处理，单个大文件单独成包。压缩加密分卷不超过 1 GiB。</p><form method="post" action="/save"><label>源目录（容器内路径）<input name="source" value="{source}"></label><div class="grid"><label>115 WebDAV URL<input name="remote_url" placeholder="https://..." value="{remote_url}"></label><label>远端目录<input name="remote_path" value="{remote_path}"></label><label>WebDAV 用户名<input name="username" value="{username}"></label><label>WebDAV 密码<input type="password" name="password" value="{password}"></label><label>归档加密密码<input type="password" name="encryption_password" value="{encryption_password}"></label><label>每日执行时间<input name="schedule" pattern="[0-2][0-9]:[0-5][0-9]" value="{schedule}"></label></div><label><input style="width:auto" type="checkbox" name="enabled" {enabled}> 启用定时备份</label><label><input style="width:auto" type="checkbox" name="keep_local" {keep_local}> 上传后保留本地归档</label><button>保存配置</button> <button formaction="/run" formmethod="post">立即备份</button></form><h2>实时进度</h2><div id="live"><span id="liveText">正在加载任务状态…</span><progress id="liveBar"></progress></div><h2>最近任务</h2><table><tr><th>开始</th><th>类型</th><th>状态</th><th>信息</th><th>归档</th></tr>{rows}</table></main>'''
 def esc(x): return str(x).replace('&','&amp;').replace('<','&lt;').replace('"','&quot;')
 class Handler(BaseHTTPRequestHandler):
     def send(self,code,body): self.send_response(code); self.send_header('Content-Type','text/html;charset=utf-8'); self.end_headers(); self.wfile.write(body.encode())
     def do_GET(self):
+        if self.path=='/progress':
+            data=[{'id':r[0],'status':r[3],'message':r[4],'archive':r[5],'kind':r[6]} for r in runs()]
+            body=json.dumps(data,ensure_ascii=False).encode(); self.send_response(200); self.send_header('Content-Type','application/json;charset=utf-8'); self.send_header('Cache-Control','no-store'); self.end_headers(); self.wfile.write(body); return
         c=load(); rr=''.join(f'<tr><td>{esc(r[1])}</td><td>{esc(r[6])}</td><td class="{"ok" if r[3]=="success" else "wait" if r[3]=="waiting" else "bad"}">{esc(r[3])}</td><td>{esc(r[4])}</td><td>{esc(r[5])}</td></tr>' for r in runs())
         vals={k:esc(v) for k,v in c.items()}; vals['enabled']='checked' if c['enabled'] else ''; vals['keep_local']='checked' if c['keep_local'] else ''; vals['rows']=rr
         page=HTML
         for k,v in vals.items(): page=page.replace('{'+k+'}',str(v))
+        page+='''<script>async function poll(){try{const items=await fetch('/progress',{cache:'no-store'}).then(r=>r.json());if(!items.length)return;const x=items[0],text=document.getElementById('liveText'),bar=document.getElementById('liveBar');text.textContent=(x.status==='running'?'运行中：':x.status+'：')+(x.message||'');const m=(x.message||'').match(/（(\d+)%）/);if(m){bar.value=Number(m[1]);bar.max=100}else{bar.removeAttribute('value')} }catch(e){}}poll();setInterval(poll,2000)</script>'''
         self.send(200,page)
     def do_POST(self):
         n=int(self.headers.get('Content-Length',0)); q=urllib.parse.parse_qs(self.rfile.read(n).decode()); c=load()
