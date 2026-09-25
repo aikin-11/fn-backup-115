@@ -64,7 +64,7 @@ class ProgressReader:
         if data: self.bytes+=len(data); self.callback(self.bytes)
         return data
 
-def make_parts(changed,prefix,password,rid,total_bytes):
+def make_parts(changed,prefix,password,rid,total_bytes,overall_done=0,overall_total=None,batch_number=1,full_run=False):
     writer=ChunkWriter(prefix); errors=[]
     done=0; total_files=len(changed)
     last_report=[0,time.monotonic()]
@@ -79,13 +79,15 @@ def make_parts(changed,prefix,password,rid,total_bytes):
             def progress(read_bytes):
                 now=time.monotonic()
                 if read_bytes-last_report[0]>=16*1024*1024 or now-last_report[1]>=3:
-                    total=min(total_bytes,done+read_bytes); pct=int(total*100/max(total_bytes,1))
-                    report(f'正在压缩加密：{index}/{total_files} 个文件，{human_size(total)} / {human_size(total_bytes)}（{pct}%）',True)
+                    total=min(total_bytes,done+read_bytes); overall=overall_done+total; pct=int(overall*100/max(overall_total or total_bytes,1))
+                    prefix=f'全量第 {batch_number} 包；' if full_run else ''
+                    report(f'{prefix}正在压缩加密：{index}/{total_files} 个文件，本包 {human_size(total)} / {human_size(total_bytes)}；总进度 {human_size(overall)} / {human_size(overall_total or total_bytes)}（{pct}%）',True)
             if info.isfile():
                 with open(path,'rb') as source: archive.addfile(info,ProgressReader(source,progress))
             else: archive.addfile(info)
             done+=size
-            report(f'已处理 {index}/{total_files} 个文件，{human_size(min(done,total_bytes))} / {human_size(total_bytes)}（{int(min(done,total_bytes)*100/max(total_bytes,1))}%）',index==total_files)
+            overall=overall_done+min(done,total_bytes); pct=int(overall*100/max(overall_total or total_bytes,1)); prefix=f'全量第 {batch_number} 包；' if full_run else ''
+            report(f'{prefix}已处理 {index}/{total_files} 个文件，本包 {human_size(min(done,total_bytes))} / {human_size(total_bytes)}；总进度 {human_size(overall)} / {human_size(overall_total or total_bytes)}（{pct}%）',index==total_files)
     if password:
         env={**os.environ,'BACKUP_PASSPHRASE':password}
         proc=subprocess.Popen(['openssl','enc','-aes-256-cbc','-pbkdf2','-iter','200000','-salt','-pass','env:BACKUP_PASSPHRASE'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
@@ -133,31 +135,40 @@ def backup():
                     last_report=time.monotonic()
         if not changed: log_run('success','没有检测到变更','',rid=rid); return
         pending_bytes=sum(sizes[rel] for _,rel in changed)
-        if pending_bytes<PART_BYTES:
+        full_run=not bool(old)
+        if not full_run and pending_bytes<PART_BYTES:
             log_run('waiting',f'待备份新增/变更数据 {human_size(pending_bytes)}，达到 1.00 GiB 后打包；定时扫描会继续累计','',rid=rid); return
-        batch=[]; batch_bytes=0
-        for item in changed:
-            if batch and batch_bytes>=PART_BYTES: break
-            batch.append(item); batch_bytes+=sizes[item[1]]
-        update_progress(rid,f'发现待备份 {human_size(pending_bytes)}；本轮处理 {len(batch)} 个文件，源数据 {human_size(batch_bytes)}')
-        kind='full' if not old else 'incremental'; stamp=datetime.now().strftime('%Y%m%d-%H%M%S'); token=secrets.token_hex(3)
-        name=f'{kind}-{stamp}-{token}.tar.gz'+('.enc' if c['encryption_password'] else '')
-        parts=make_parts(batch,os.path.join(STORE,name),c['encryption_password'],rid,batch_bytes)
-        if c['remote_url']:
-            for index,part in enumerate(parts,1):
-                update_progress(rid,f'正在上传分卷 {index}/{len(parts)}：{os.path.getsize(part)/(1024**2):.0f} MiB')
-                dav_put(remote_url(c,os.path.basename(part)),part,c['username'],c['password'])
-        updated=old.copy()
-        for rel in list(updated):
-            if rel not in current: updated.pop(rel)
-        for _,rel in batch: updated[rel]=current[rel]
-        tmp=manifest_path+'.tmp'
-        with open(tmp,'w') as f: json.dump(updated,f)
-        os.replace(tmp,manifest_path)
-        if c['remote_url'] and not c['keep_local']:
-            for part in parts: os.remove(part)
-        remaining=pending_bytes-batch_bytes
-        log_run('success',f'完成：打包 {len(batch)} 个文件（源数据 {human_size(batch_bytes)}），{len(parts)} 个分卷；待下次扫描 {human_size(max(0,remaining))}',name,rid=rid)
+        remaining=changed[:]; overall_done=0; batch_number=0; completed_parts=0; final_name=''
+        while remaining:
+            batch=[]; batch_bytes=0
+            for item in remaining:
+                if batch and batch_bytes>=PART_BYTES: break
+                batch.append(item); batch_bytes+=sizes[item[1]]
+            batch_number+=1; kind='full' if full_run else 'incremental'; stamp=datetime.now().strftime('%Y%m%d-%H%M%S'); token=secrets.token_hex(3)
+            name=f'{kind}-{stamp}-{token}.tar.gz'+('.enc' if c['encryption_password'] else ''); final_name=name
+            prefix=f'全量第 {batch_number} 包；' if full_run else ''
+            update_progress(rid,f'{prefix}发现待备份 {human_size(pending_bytes-overall_done)}；本包处理 {len(batch)} 个文件，源数据 {human_size(batch_bytes)}')
+            parts=make_parts(batch,os.path.join(STORE,name),c['encryption_password'],rid,batch_bytes,overall_done,pending_bytes,batch_number,full_run)
+            if c['remote_url']:
+                for index,part in enumerate(parts,1):
+                    update_progress(rid,f'{prefix}总进度 {human_size(overall_done)} / {human_size(pending_bytes)}；正在上传分卷 {index}/{len(parts)}：{os.path.getsize(part)/(1024**2):.0f} MiB')
+                    dav_put(remote_url(c,os.path.basename(part)),part,c['username'],c['password'])
+            updated=old.copy()
+            for rel in list(updated):
+                if rel not in current: updated.pop(rel)
+            for _,rel in batch: updated[rel]=current[rel]
+            tmp=manifest_path+'.tmp'
+            with open(tmp,'w') as f: json.dump(updated,f)
+            os.replace(tmp,manifest_path); old=updated
+            if c['remote_url'] and not c['keep_local']:
+                for part in parts: os.remove(part)
+            overall_done+=batch_bytes; completed_parts+=len(parts)
+            remaining=remaining[len(batch):]
+            if full_run and remaining:
+                update_progress(rid,f'全量已完成 {human_size(overall_done)} / {human_size(pending_bytes)}；开始第 {batch_number+1} 个 1 GiB 包')
+            elif not full_run:
+                break
+        log_run('success',f'{"首轮全量" if full_run else "增量备份"}完成：{batch_number} 个归档批次，{completed_parts} 个分卷，已处理 {human_size(overall_done)}',final_name,rid=rid)
     except Exception as e: log_run('failed',str(e),rid=rid)
     finally: lock.release()
 
