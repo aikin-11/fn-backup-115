@@ -27,7 +27,7 @@ def runs():
 
 def dav_put(url, local, user, password):
     u=urllib.parse.urlsplit(url); conn=(http.client.HTTPSConnection if u.scheme=='https' else http.client.HTTPConnection)(u.hostname,u.port,timeout=120)
-    path=u.path or '/'; auth=base64.b64encode((user+':'+password).encode()).decode(); size=os.path.getsize(local)
+    path=urllib.parse.quote(u.path or '/',safe='/%'); auth=base64.b64encode((user+':'+password).encode()).decode(); size=os.path.getsize(local)
     conn.request('PUT',path,open(local,'rb'),{'Content-Length':str(size),'Authorization':'Basic '+auth,'Content-Type':'application/octet-stream'})
     r=conn.getresponse(); data=r.read(200); conn.close()
     if r.status not in (200,201,204): raise RuntimeError('WebDAV 上传失败: HTTP %s %s'%(r.status,data.decode(errors='ignore')))
