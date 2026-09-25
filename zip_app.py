@@ -192,8 +192,11 @@ def make_zip(batch, path, password, rid, number):
 
 def upload(c, path, rid):
     global active_connection
-    url = c['remote_url'].rstrip('/')+'/'+c['remote_path'].strip('/')+'/'+urllib.parse.quote(os.path.basename(path))
-    u = urllib.parse.urlsplit(url)
+    u = urllib.parse.urlsplit(c['remote_url'].rstrip('/'))
+    dav_root = u.path.rstrip('/')
+    if not dav_root.endswith('/dav'): dav_root += '/dav'
+    target = dav_root+'/'+c['remote_path'].strip('/')+'/'+os.path.basename(path)
+    target = urllib.parse.quote(urllib.parse.unquote(target),safe='/')
     conn = (http.client.HTTPSConnection if u.scheme=='https' else http.client.HTTPConnection)(u.hostname,u.port,timeout=3600)
     done, waiting, start_wait = threading.Event(), threading.Event(), [0]
     def heartbeat():
@@ -203,7 +206,7 @@ def upload(c, path, rid):
     with network_lock: active_connection=conn
     try:
         check_cancel(); size=os.path.getsize(path)
-        conn.putrequest('PUT',urllib.parse.quote(urllib.parse.unquote(u.path),safe='/'))
+        conn.putrequest('PUT',target)
         conn.putheader('Content-Length',str(size)); conn.putheader('Authorization','Basic '+base64.b64encode((c['username']+':'+c['password']).encode()).decode())
         conn.putheader('Content-Type','application/zip'); conn.endheaders()
         sent,last=0,time.monotonic()
