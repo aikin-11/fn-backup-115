@@ -1,0 +1,12 @@
+services:
+  fn-backup-115:
+    build: .
+    container_name: fn-backup-115
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/config
+      - ./backups:/backups
+      # 将飞牛上的源目录映射到容器内，例如 /share/Media:/data/Media:ro
+      - /share:/data:ro
+    restart: unless-stopped
