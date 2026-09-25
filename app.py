@@ -192,7 +192,7 @@ class Handler(BaseHTTPRequestHandler):
         vals={k:esc(v) for k,v in c.items()}; vals['enabled']='checked' if c['enabled'] else ''; vals['keep_local']='checked' if c['keep_local'] else ''; vals['rows']=rr
         page=HTML
         for k,v in vals.items(): page=page.replace('{'+k+'}',str(v))
-        page+='''<script>async function poll(){try{const items=await fetch('/progress',{cache:'no-store'}).then(r=>r.json());if(!items.length)return;const x=items[0],text=document.getElementById('liveText'),bar=document.getElementById('liveBar');text.textContent=(x.status==='running'?'运行中：':x.status+'：')+(x.message||'');const m=(x.message||'').match(/（(\d+)%）/);if(m){bar.value=Number(m[1]);bar.max=100}else{bar.removeAttribute('value')} }catch(e){}}poll();setInterval(poll,2000)</script>'''
+        page+='''<script>async function poll(){try{const items=await fetch('/progress',{cache:'no-store'}).then(r=>r.json());if(!items.length)return;const x=items[0],text=document.getElementById('liveText'),bar=document.getElementById('liveBar');text.textContent=(x.status==='running'?'运行中：':x.status+'：')+(x.message||'');const m=(x.message||'').match(/（([0-9]+)%）/);if(m){bar.value=Number(m[1]);bar.max=100}else{bar.removeAttribute('value')} }catch(e){}}poll();setInterval(poll,2000)</script>'''
         self.send(200,page)
     def do_POST(self):
         n=int(self.headers.get('Content-Length',0)); q=urllib.parse.parse_qs(self.rfile.read(n).decode()); c=load()
