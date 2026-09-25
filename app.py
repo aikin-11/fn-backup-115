@@ -18,6 +18,8 @@ def save(c):
     os.chmod(tmp,0o600); os.replace(tmp,CFG)
 def db():
     c=sqlite3.connect(DB); c.execute('create table if not exists runs(id integer primary key, started text, finished text, status text, message text, archive text, kind text)'); c.commit(); return c
+def recover_runs():
+    c=db(); c.execute("update runs set finished=?,status='interrupted',message='容器重启，任务已中断' where status='running'",(datetime.now().isoformat(timespec='seconds'),)); c.commit(); c.close()
 def log_run(status,msg='',archive='',kind='incremental',rid=None):
     c=db(); now=datetime.now().isoformat(timespec='seconds')
     if rid: c.execute('update runs set finished=?,status=?,message=?,archive=? where id=?',(now,status,msg,archive,rid))
@@ -29,12 +31,21 @@ def update_progress(rid,msg):
 def runs():
     c=db(); rows=c.execute('select id,started,finished,status,message,archive,kind from runs order by id desc limit 30').fetchall(); c.close(); return rows
 
-def dav_put(url, local, user, password):
-    u=urllib.parse.urlsplit(url); conn=(http.client.HTTPSConnection if u.scheme=='https' else http.client.HTTPConnection)(u.hostname,u.port,timeout=120)
+def dav_put(url, local, user, password, progress=None):
+    u=urllib.parse.urlsplit(url); conn=(http.client.HTTPSConnection if u.scheme=='https' else http.client.HTTPConnection)(u.hostname,u.port,timeout=3600)
     path=urllib.parse.quote(u.path or '/',safe='/%'); auth=base64.b64encode((user+':'+password).encode()).decode(); size=os.path.getsize(local)
-    conn.request('PUT',path,open(local,'rb'),{'Content-Length':str(size),'Authorization':'Basic '+auth,'Content-Type':'application/octet-stream'})
-    r=conn.getresponse(); data=r.read(200); conn.close()
-    if r.status not in (200,201,204): raise RuntimeError('WebDAV 上传失败: HTTP %s %s'%(r.status,data.decode(errors='ignore')))
+    try:
+        conn.putrequest('PUT',path); conn.putheader('Content-Length',str(size)); conn.putheader('Authorization','Basic '+auth); conn.putheader('Content-Type','application/octet-stream'); conn.endheaders()
+        sent=0; last=[0,time.monotonic()]
+        with open(local,'rb') as f:
+            while block:=f.read(8*1024*1024):
+                conn.send(block); sent+=len(block)
+                now=time.monotonic()
+                if progress and (sent-last[0]>=32*1024*1024 or now-last[1]>=3 or sent==size):
+                    progress(sent,size); last[:]=[sent,now]
+        r=conn.getresponse(); data=r.read(200)
+        if r.status not in (200,201,204): raise RuntimeError('WebDAV 上传失败: HTTP %s %s'%(r.status,data.decode(errors='ignore')))
+    finally: conn.close()
 def remote_url(c,name): return c['remote_url'].rstrip('/')+'/'+c['remote_path'].strip('/')+'/'+urllib.parse.quote(name)
 
 def human_size(size):
@@ -151,8 +162,13 @@ def backup():
             parts=make_parts(batch,os.path.join(STORE,name),c['encryption_password'],rid,batch_bytes,overall_done,pending_bytes,batch_number,full_run)
             if c['remote_url']:
                 for index,part in enumerate(parts,1):
-                    update_progress(rid,f'{prefix}总进度 {human_size(overall_done)} / {human_size(pending_bytes)}；正在上传分卷 {index}/{len(parts)}：{os.path.getsize(part)/(1024**2):.0f} MiB')
-                    dav_put(remote_url(c,os.path.basename(part)),part,c['username'],c['password'])
+                    part_size=os.path.getsize(part); last_upload=[0]
+                    def upload_progress(sent,total):
+                        if sent-last_upload[0]>=32*1024*1024 or sent==total:
+                            update_progress(rid,f'{prefix}正在上传分卷 {index}/{len(parts)}：{sent/(1024**2):.0f} / {total/(1024**2):.0f} MiB（{int(sent*100/max(total,1))}%）')
+                            last_upload[0]=sent
+                    upload_progress(0,part_size)
+                    dav_put(remote_url(c,os.path.basename(part)),part,c['username'],c['password'],upload_progress)
             updated=old.copy()
             for rel in list(updated):
                 if rel not in current: updated.pop(rel)
@@ -188,17 +204,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.path=='/progress':
             data=[{'id':r[0],'status':r[3],'message':r[4],'archive':r[5],'kind':r[6]} for r in runs()]
             body=json.dumps(data,ensure_ascii=False).encode(); self.send_response(200); self.send_header('Content-Type','application/json;charset=utf-8'); self.send_header('Cache-Control','no-store'); self.end_headers(); self.wfile.write(body); return
-        c=load(); rr=''.join(f'<tr><td>{esc(r[1])}</td><td>{esc(r[6])}</td><td class="{"ok" if r[3]=="success" else "wait" if r[3]=="waiting" else "bad"}">{esc(r[3])}</td><td>{esc(r[4])}</td><td>{esc(r[5])}</td></tr>' for r in runs())
+        c=load(); rr=''.join(f'<tr><td>{esc(r[1])}</td><td>{esc(r[6])}</td><td class="{"ok" if r[3]=="success" else "wait" if r[3] in ("waiting","interrupted") else "bad"}">{esc(r[3])}</td><td>{esc(r[4])}</td><td>{esc(r[5])}</td></tr>' for r in runs())
         vals={k:esc(v) for k,v in c.items()}; vals['enabled']='checked' if c['enabled'] else ''; vals['keep_local']='checked' if c['keep_local'] else ''; vals['rows']=rr
         page=HTML
         for k,v in vals.items(): page=page.replace('{'+k+'}',str(v))
         page+='''<script>async function poll(){try{const items=await fetch('/progress',{cache:'no-store'}).then(r=>r.json());if(!items.length)return;const x=items[0],text=document.getElementById('liveText'),bar=document.getElementById('liveBar');text.textContent=(x.status==='running'?'运行中：':x.status+'：')+(x.message||'');const m=(x.message||'').match(/（([0-9]+)%）/);if(m){bar.value=Number(m[1]);bar.max=100}else{bar.removeAttribute('value')} }catch(e){}}poll();setInterval(poll,2000)</script>'''
         self.send(200,page)
     def do_POST(self):
-        n=int(self.headers.get('Content-Length',0)); q=urllib.parse.parse_qs(self.rfile.read(n).decode()); c=load()
-        for k in DEFAULT:
-            if k in q: c[k]=q[k][0]
-        c['enabled']='enabled' in q; c['keep_local']='keep_local' in q; save(c)
-        if self.path=='/run': threading.Thread(target=backup,daemon=True).start()
+        if self.path=='/save':
+            n=int(self.headers.get('Content-Length',0)); q=urllib.parse.parse_qs(self.rfile.read(n).decode()); c=load()
+            for k in DEFAULT:
+                if k in q: c[k]=q[k][0]
+            c['enabled']='enabled' in q; c['keep_local']='keep_local' in q; save(c)
+        elif self.path=='/run': threading.Thread(target=backup,daemon=True).start()
+        else: self.send(404,'Not found'); return
         self.send_response(303); self.send_header('Location','/'); self.end_headers()
-if __name__=='__main__': db(); threading.Thread(target=scheduler,daemon=True).start(); ThreadingHTTPServer(('0.0.0.0',8080),Handler).serve_forever()
+if __name__=='__main__': db(); recover_runs(); threading.Thread(target=scheduler,daemon=True).start(); ThreadingHTTPServer(('0.0.0.0',8080),Handler).serve_forever()
