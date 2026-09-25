@@ -83,6 +83,7 @@ class BackupTests(unittest.TestCase):
         with patch.object(app.http.client,'HTTPConnection',return_value=conn):
             with self.assertRaisesRegex(RuntimeError,'HTTP 413 Content Too Large.*server limit'):
                 app.upload(c,str(archive),self.rid)
+        self.assertEqual(conn.putrequest.call_args.args[1],'/dav/115/backup/early-reject.zip')
 
     def test_source_isolation_and_traversal(self):
         with self.assertRaises(ValueError):app.source_path('/etc')
