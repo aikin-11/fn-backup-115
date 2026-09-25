@@ -59,7 +59,7 @@ def backup():
         if c['remote_url']:
             dav_put(remote_url(c,name),final,c['username'],c['password'])
         with open(manifest_path,'w') as f: json.dump(current,f)
-        if not c['keep_local']: os.remove(final)
+        if c['remote_url'] and not c['keep_local']: os.remove(final)
         log_run('success',f'完成：{len(changed)} 个文件',name,rid=rid)
     except Exception as e: log_run('failed',str(e),rid=rid)
 
