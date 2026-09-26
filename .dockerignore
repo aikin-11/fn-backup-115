@@ -5,3 +5,12 @@ tests
 *.zip
 *.building
 .git
+.github
+.venv
+venv
+config.json
+backup.db
+zip-state-*.json
+app.py
+mihomo-sub-manager/
+tests/test_sub_manager.py
