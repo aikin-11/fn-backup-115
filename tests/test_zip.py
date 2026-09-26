@@ -16,6 +16,21 @@ from PIL import Image
 app.init()
 
 class BackupTests(unittest.TestCase):
+    def test_archive_names_sort_by_run_time_then_package_number(self):
+        from datetime import datetime
+        stamp=datetime(2026,9,26,11,46,3)
+        names=[app.archive_filename('full',stamp,12,n,'abcdef') for n in (1,2,10)]
+        self.assertEqual(names,sorted(names))
+        self.assertEqual(app.package_kind(names[0]),'full')
+        self.assertEqual(app.package_kind('full-legacy.zip'),'full')
+        self.assertEqual(app.package_kind('20260926-114603-00000012-incremental-0001-abcdef.zip'),'incremental')
+
+    def test_recent_logs_are_newest_first(self):
+        with app.db() as c:
+            c.execute("insert into events(run_id,at,message) values(?,?,?)",(self.rid,'2026-09-26T10:00:00','old'))
+            c.execute("insert into events(run_id,at,message) values(?,?,?)",(self.rid,'2026-09-26T11:00:00','new'))
+        self.assertEqual([e['message'] for e in app.latest_events(2)],['new','old'])
+
     def setUp(self):
         app.cancel.clear()
         with app.db() as c:
