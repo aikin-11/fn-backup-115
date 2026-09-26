@@ -51,9 +51,14 @@ def init():
         c.execute('create table if not exists runs(id integer primary key, started text, finished text, status text, message text, archive text, kind text)')
         c.execute('create table if not exists events(id integer primary key, run_id integer, at text, message text)')
         c.execute('create table if not exists observed(day text, rel text, sig text, size integer, primary key(day,rel,sig))')
-        c.execute('create table if not exists uploaded_packages(name text primary key, completed text, size integer, source text, remote_path text, run_id integer, kind text, item_count integer)')
+        c.execute('create table if not exists uploaded_packages(name text primary key, completed text, size integer, source text, remote_path text, run_id integer, kind text, item_count integer, remote_url text, state_file text)')
+        c.execute('create table if not exists upload_events(name text primary key, day text, uploaded_at text, size integer)')
         c.execute('create table if not exists package_files(name text, rel text, sig text, size integer, primary key(name,rel))')
-        c.execute('create table if not exists run_progress(run_id integer primary key, total_bytes integer default 0, completed_bytes integer default 0, current_bytes integer default 0, sent_bytes integer default 0, package_index integer default 0, package_count integer default 0, threshold_bytes integer default 5368709120)')
+        c.execute('create table if not exists deleted_packages(name text primary key, deleted text)')
+        c.execute('create table if not exists run_progress(run_id integer primary key, total_bytes integer default 0, completed_bytes integer default 0, current_bytes integer default 0, sent_bytes integer default 0, package_index integer default 0, package_count integer default 0, threshold_bytes integer default 5368709120, archive_bytes integer default 0, current_source_bytes integer default 0)')
+        for table,column,declaration in (('uploaded_packages','remote_url','text'),('uploaded_packages','state_file','text'),('run_progress','archive_bytes','integer default 0'),('run_progress','current_source_bytes','integer default 0')):
+            if column not in {r[1] for r in c.execute(f'pragma table_info({table})')}:
+                c.execute(f'alter table {table} add column {column} {declaration}')
         c.execute("update runs set status='interrupted',finished=?,message='旧任务已停止；已完成的归档保留' where status='running'", (now(),))
     c = load()
     if c.get('zip_version') != 2:
@@ -100,10 +105,11 @@ def photo_time(path, st):
         except (OSError, ValueError, subprocess.SubprocessError): birth = 0
     return (birth, '创建时间') if birth > 0 else (st.st_mtime, '修改时间回退')
 
-def scan(source, old, rid, cache=None, save_cache=None):
+def scan(source, old, rid, cache=None, save_cache=None, progress_base=0):
     cache = cache if cache is not None else {}
     save_cache = save_cache or (lambda value: None)
     found, count, skipped, kinds = [], 0, 0, {}
+    found_bytes=0
     cache_dirty, last_report = 0, time.monotonic()
     def walk_error(e): raise e
     for base, dirs, files in os.walk(source, onerror=walk_error):
@@ -123,15 +129,17 @@ def scan(source, old, rid, cache=None, save_cache=None):
                 cache_dirty += 1
             kinds[origin] = kinds.get(origin,0)+1
             if old.get(rel) != sig:
-                found.append(dict(path=path, rel=rel, size=st.st_size, sig=signature(st), time=ts, time_source=origin))
+                found.append(dict(path=path, rel=rel, size=st.st_size, sig=signature(st), time=ts, time_source=origin)); found_bytes+=st.st_size
             if cache_dirty >= 1000:
                 save_cache(cache)
                 cache_dirty = 0
             if count % 5000 == 0 or time.monotonic() - last_report >= 10:
                 event(rid, f'扫描目录 {count} 个文件；待备份 {len(found)} 个；照片日期索引已缓存')
+                set_progress(rid,total_bytes=progress_base+found_bytes)
                 last_report = time.monotonic()
     save_cache(cache)
     found.sort(key=lambda x:(x['time'],x['rel']))
+    set_progress(rid,total_bytes=progress_base+found_bytes)
     event(rid, f'扫描完成：{count} 个文件，新增或修改 {len(found)} 个；日期来源 {kinds}；跳过链接/特殊文件 {skipped}')
     return found
 
@@ -149,7 +157,7 @@ def record_observed(items):
         con.executemany('insert or ignore into observed(day,rel,sig,size) values(?,?,?,?)',[(day,x['rel'],x['sig'],x['size']) for x in items])
 
 def set_progress(rid, **values):
-    allowed={'total_bytes','completed_bytes','current_bytes','sent_bytes','package_index','package_count','threshold_bytes'}
+    allowed={'total_bytes','completed_bytes','current_bytes','current_source_bytes','archive_bytes','sent_bytes','package_index','package_count','threshold_bytes'}
     values={k:int(v) for k,v in values.items() if k in allowed}
     if not values:return
     with db() as con:
@@ -227,12 +235,13 @@ def upload(c, path, rid):
         conn.putrequest('PUT',target)
         conn.putheader('Content-Length',str(size)); conn.putheader('Authorization','Basic '+base64.b64encode((c['username']+':'+c['password']).encode()).decode())
         conn.putheader('Content-Type','application/zip'); conn.endheaders()
-        sent,last=0,time.monotonic(); set_progress(rid,sent_bytes=0,current_bytes=size)
+        sent,last=0,time.monotonic(); set_progress(rid,sent_bytes=0,archive_bytes=size,current_bytes=size)
         try:
             with open(path,'rb') as f:
                 while block:=f.read(BLOCK):
-                    check_cancel(); conn.send(block); sent+=len(block); set_progress(rid,sent_bytes=sent)
+                    check_cancel(); conn.send(block); sent+=len(block)
                     if time.monotonic()-last>=2 or sent==size:
+                        set_progress(rid,sent_bytes=sent,archive_bytes=size,current_bytes=size)
                         event(rid,f'发送 ZIP 至 OpenList：{sent/BLOCK:.0f}/{size/BLOCK:.0f} MiB（{int(sent*100/max(size,1))}%）'); last=time.monotonic()
         except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError) as exc:
             # Many WebDAV servers reject a PUT (for example auth/path/size policy)
@@ -264,17 +273,22 @@ def commit_package(state, sp, pending, c, rid=None):
     state['packages'].append(dict(name=pending['name'],completed=now(),count=len(pending['files']),files=pending['files']))
     path=os.path.join(STORE,pending['name']); size=os.path.getsize(path) if os.path.exists(path) else int(pending.get('archive_size',0))
     with db() as con:
-        con.execute('insert or ignore into uploaded_packages(name,completed,size,source,remote_path,run_id,kind,item_count) values(?,?,?,?,?,?,?,?)',(pending['name'],now(),size,c['source'],c['remote_path'],rid,'full' if pending['name'].startswith('full-') else 'incremental',len(pending['files'])))
+        con.execute('insert or ignore into uploaded_packages(name,completed,size,source,remote_path,run_id,kind,item_count,remote_url,state_file) values(?,?,?,?,?,?,?,?,?,?)',(pending['name'],now(),size,c['source'],c['remote_path'],rid,'full' if pending['name'].startswith('full-') else 'incremental',len(pending['files']),c['remote_url'],sp))
+        completed=now(); con.execute('insert or ignore into upload_events(name,day,uploaded_at,size) values(?,?,?,?)',(pending['name'],completed[:10],completed,size))
         con.executemany('insert or ignore into package_files(name,rel,sig,size) values(?,?,?,?)',[(pending['name'],rel,sig,int(pending.get('items_by_rel',{}).get(rel,0))) for rel,sig in pending['files'].items()])
     state.pop('pending',None); atomic_json(sp,state)
     if not c['keep_local']: os.remove(os.path.join(STORE,pending['name']))
     if rid:
         with db() as con:
-            con.execute('update run_progress set completed_bytes=completed_bytes+?,current_bytes=0,sent_bytes=0 where run_id=?',(sum(x['size'] for x in pending.get('items',[])),rid))
+            row=con.execute('select package_index,package_count from run_progress where run_id=?',(rid,)).fetchone()
+            final=row and row['package_index']>=row['package_count']
+            source_size=sum(x['size'] for x in pending.get('items',[])) or sum(x.get('size',0) for x in pending.get('hashes',{}).values())
+            final_archive_size=int(pending.get('archive_size',size))
+            con.execute('update run_progress set completed_bytes=completed_bytes+?,current_bytes=?,current_source_bytes=?,archive_bytes=?,sent_bytes=? where run_id=?',(source_size,final_archive_size if final else 0,source_size if final else 0,final_archive_size if final else 0,final_archive_size if final else 0,rid))
 
 def package_metrics():
     with db() as con:
-        daily=[dict(r) for r in con.execute('select d.day,coalesce(o.added,0) added,coalesce(u.uploaded,0) uploaded from (select day from observed union select substr(completed,1,10) day from uploaded_packages) d left join (select day,sum(size) added from observed group by day) o on o.day=d.day left join (select substr(completed,1,10) day,sum(size) uploaded from uploaded_packages group by substr(completed,1,10)) u on u.day=d.day order by d.day desc limit 370')]
+        daily=[dict(r) for r in con.execute('select d.day,coalesce(o.added,0) added,coalesce(u.uploaded,0) uploaded from (select day from observed union select day from upload_events) d left join (select day,sum(size) added from observed group by day) o on o.day=d.day left join (select day,sum(size) uploaded from upload_events group by day) u on u.day=d.day order by d.day desc limit 370')]
         packages=[dict(r) for r in con.execute('select name,completed,size,kind,item_count,remote_path from uploaded_packages order by completed desc limit 2000')]
     return daily,packages
 
@@ -285,64 +299,77 @@ def sync_state_packages(c):
     except (OSError,ValueError): return
     with db() as con:
         for item in state.get('packages',[]):
+            name=item.get('name','')
+            if not name or con.execute('select 1 from deleted_packages where name=?',(name,)).fetchone(): continue
             local=os.path.join(STORE,item.get('name',''))
             size=os.path.getsize(local) if os.path.isfile(local) else 0
-            con.execute('insert or ignore into uploaded_packages(name,completed,size,source,remote_path,kind,item_count) values(?,?,?,?,?,?,?)',(item.get('name',''),item.get('completed',''),size,c['source'],c['remote_path'],'full' if item.get('name','').startswith('full-') else 'incremental',item.get('count',0)))
-            con.executemany('insert or ignore into package_files(name,rel,sig,size) values(?,?,?,?)',[(item.get('name',''),rel,sig,0) for rel,sig in item.get('files',{}).items()])
+            con.execute('insert into uploaded_packages(name,completed,size,source,remote_path,kind,item_count,remote_url,state_file) values(?,?,?,?,?,?,?,?,?) on conflict(name) do update set size=case when uploaded_packages.size=0 then excluded.size else uploaded_packages.size end,remote_url=coalesce(nullif(uploaded_packages.remote_url,''),excluded.remote_url),state_file=coalesce(uploaded_packages.state_file,excluded.state_file)',(name,item.get('completed',''),size,c['source'],c['remote_path'],'full' if name.startswith('full-') else 'incremental',item.get('count',0),c['remote_url'],sp))
+            if item.get('completed'):
+                completed=item['completed']; con.execute('insert into upload_events(name,day,uploaded_at,size) values(?,?,?,?) on conflict(name) do update set size=case when upload_events.size=0 then excluded.size else upload_events.size end',(name,completed[:10],completed,size))
+            con.executemany('insert or ignore into package_files(name,rel,sig,size) values(?,?,?,?)',[(name,rel,sig,0) for rel,sig in item.get('files',{}).items()])
+
+def forget_state_package(state_file,name,c):
+    path=os.path.realpath(state_file or state_path(c)); root=os.path.realpath(ROOT)
+    if os.path.commonpath((root,path))!=root: raise ValueError('归档状态路径越界，拒绝修改')
+    try:
+        with open(path) as f: state=json.load(f)
+    except FileNotFoundError: return
+    matches=[p for p in state.get('packages',[]) if p.get('name')==name]
+    if any(not p.get('files') for p in matches):
+        state['files']={}; state['baseline_complete']=False
+    else:
+        for package in matches:
+            for rel,sig in package.get('files',{}).items():
+                if state.get('files',{}).get(rel)==sig: state['files'].pop(rel,None)
+    state['packages']=[p for p in state.get('packages',[]) if p.get('name')!=name]
+    atomic_json(path,state)
 
 def delete_completed(c,names):
     if not names or len(names)>2000 or len(set(names))!=len(names): raise ValueError('请选择要删除的已完成 ZIP（最多 2000 个）')
-    u=urllib.parse.urlsplit(c['remote_url'].rstrip('/')); dav_root=u.path.rstrip('/')
-    if not dav_root.endswith('/dav'): dav_root+='/dav'
-    conn=(http.client.HTTPSConnection if u.scheme=='https' else http.client.HTTPConnection)(u.hostname,u.port,timeout=60)
     headers={'Authorization':'Basic '+base64.b64encode((c['username']+':'+c['password']).encode()).decode()}
+    with db() as con:
+        rows={r['name']:dict(r) for r in con.execute('select * from uploaded_packages')}
+        file_map={name:[dict(r) for r in con.execute('select rel,sig,size from package_files where name=?',(name,))] for name in rows}
+    for name in names:
+        if name not in rows or os.path.basename(name)!=name or not name.endswith('.zip'): raise ValueError('只能删除已确认上传成功的 ZIP：'+str(name))
+    if any(not file_map.get(n) for n in names) and set(names)!=set(rows): raise ValueError('旧版已完成包没有逐包文件清单。为避免删除后漏备份，只能一次选中并删除全部已完成包，重置全量清单。')
+    deleted=[]; warnings=[]
     try:
-        with db() as con:
-            rows={r['name']:dict(r) for r in con.execute('select * from uploaded_packages')}
-            file_map={name:[dict(r) for r in con.execute('select rel,sig,size from package_files where name=?',(name,))] for name in rows}
         for name in names:
-            if name not in rows or os.path.basename(name)!=name or not name.endswith('.zip'): raise ValueError('只能删除已确认上传成功的 ZIP：'+str(name))
-        if any(not file_map.get(n) for n in names) and set(names)!=set(rows): raise ValueError('旧版已完成包没有逐包文件清单。为避免删除后漏备份，只能一次选中并删除全部已完成包，重置全量清单。')
-        deleted=[]
-        try:
-            for name in names:
-                row=rows[name]; remote=row['remote_path'].strip('/')
-                target=urllib.parse.quote(dav_root+'/'+remote+'/'+name,safe='/')
+            row=rows[name]; target_url=row.get('remote_url') or c['remote_url']
+            u=urllib.parse.urlsplit(target_url.rstrip('/')); dav_root=u.path.rstrip('/')
+            if u.scheme not in ('http','https') or not u.hostname: raise ValueError(f'{name} 没有有效的 WebDAV 地址，未删除')
+            if not dav_root.endswith('/dav'): dav_root+='/dav'
+            remote=row['remote_path'].strip('/')
+            target=urllib.parse.quote(dav_root+'/'+remote+'/'+name,safe='/')
+            conn=(http.client.HTTPSConnection if u.scheme=='https' else http.client.HTTPConnection)(u.hostname,u.port,timeout=60)
+            try:
                 conn.request('DELETE',target,headers=headers); response=conn.getresponse(); response.read()
                 if response.status not in (200,202,204,404): raise RuntimeError(f'{name} 删除失败：HTTP {response.status} {response.reason}')
-                deleted.append(name)
-                with db() as con:
-                    con.execute('delete from package_files where name=?',(name,)); con.execute('delete from uploaded_packages where name=?',(name,))
-                local=os.path.join(STORE,name)
-                if os.path.isfile(local): os.remove(local)
-        except http.client.HTTPException as exc:
-            raise RuntimeError(f'删除 115 文件时 WebDAV 连接异常；已成功删除 {len(deleted)} 个包') from exc
-        run_ids={rows[n]['run_id'] for n in names if rows[n].get('run_id')}
-        with db() as con:
-            for rid in run_ids:
-                remaining=con.execute('select 1 from uploaded_packages where run_id=? limit 1',(rid,)).fetchone()
-                if not remaining:
-                    con.execute('delete from events where run_id=?',(rid,)); con.execute('delete from run_progress where run_id=?',(rid,)); con.execute('delete from runs where id=? and status in (\'success\',\'waiting\',\'failed\',\'cancelled\',\'interrupted\')',(rid,))
-            for name in names:
+            finally: conn.close()
+            deleted.append(name)
+            # Tombstone first: even if state-file cleanup fails, the next inventory sync
+            # cannot resurrect a remote object that has already been deleted.
+            with db() as con:
+                con.execute('insert or ignore into deleted_packages(name,deleted) values(?,?)',(name,now()))
+                con.execute('delete from package_files where name=?',(name,)); con.execute('delete from uploaded_packages where name=?',(name,))
+            local=os.path.join(STORE,name)
+            if os.path.isfile(local): os.remove(local)
+            try:
+                forget_state_package(row.get('state_file'),name,c)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                warnings.append(f'{name} 已从 115 删除；状态文件清理失败（{exc}），已记录防复现标记')
+            with db() as con:
+                if row.get('run_id'):
+                    remaining=con.execute('select 1 from uploaded_packages where run_id=? limit 1',(row['run_id'],)).fetchone()
+                    if not remaining:
+                        con.execute('delete from events where run_id=?',(row['run_id'],)); con.execute('delete from run_progress where run_id=?',(row['run_id'],)); con.execute('delete from runs where id=? and status in (\'success\',\'waiting\',\'failed\',\'cancelled\',\'interrupted\')',(row['run_id'],))
                 con.execute('delete from events where run_id in (select id from runs where archive=? and status=\'success\')',(name,))
                 con.execute('delete from run_progress where run_id in (select id from runs where archive=? and status=\'success\')',(name,))
                 con.execute('delete from runs where archive=? and status=\'success\'',(name,))
-        sp=state_path(c)
-        try:
-            with open(sp) as f: state=json.load(f)
-            old_unknown=any(not p.get('files') for p in state.get('packages',[]) if p.get('name') in deleted)
-            if old_unknown:
-                state['files']={}; state['packages']=[]; state['baseline_complete']=False
-            else:
-                for p in state.get('packages',[]):
-                    if p.get('name') in deleted:
-                        for rel,sig in p.get('files',{}).items():
-                            if state.get('files',{}).get(rel)==sig: state['files'].pop(rel,None)
-                state['packages']=[p for p in state.get('packages',[]) if p.get('name') not in deleted]
-            atomic_json(sp,state)
-        except (OSError,ValueError): pass
-        return deleted
-    finally: conn.close()
+    except http.client.HTTPException as exc:
+        raise RuntimeError(f'删除 115 文件时 WebDAV 连接异常；已成功删除 {len(deleted)} 个包') from exc
+    return deleted,warnings
 
 def perform(c, manual):
     rid=None
@@ -353,12 +380,17 @@ def perform(c, manual):
         except FileNotFoundError: state=dict(files={},baseline_complete=False,packages=[])
         full=not state['baseline_complete']
         with db() as con: rid=con.execute('insert into runs(started,status,message,archive,kind) values(?,?,?,?,?)',(now(),'running','正在扫描','','full' if full else 'incremental')).lastrowid
+        pre_completed=0
+        set_progress(rid,total_bytes=0,completed_bytes=0,current_bytes=0,current_source_bytes=0,archive_bytes=0,sent_bytes=0,package_index=0,package_count=0,threshold_bytes=5*GIB)
         pending=state.get('pending')
         if pending:
             path=os.path.join(STORE,pending['name']); event(rid,'重试上次已生成的独立 ZIP：'+pending['name'])
+            pre_completed=sum(x['size'] for x in pending.get('items',[])) or sum(x.get('size',0) for x in pending.get('hashes',{}).values())
+            archive_size=os.path.getsize(path)
+            set_progress(rid,total_bytes=pre_completed,completed_bytes=0,current_bytes=archive_size,current_source_bytes=pre_completed,archive_bytes=archive_size,sent_bytes=0,package_index=1,package_count=1,threshold_bytes=5*GIB)
             verify_zip(path,c['encryption_password'],pending['hashes'],rid); upload(c,path,rid); commit_package(state,sp,pending,c,rid)
         cache = state.get('date_cache', {})
-        items=scan(source,state['files'],rid,cache,lambda value: (state.update(date_cache=value), atomic_json(sp,state)))
+        items=scan(source,state['files'],rid,cache,lambda value: (state.update(date_cache=value), atomic_json(sp,state)),pre_completed)
         total=sum(x['size'] for x in items)
         record_observed(items)
         if not items:
@@ -367,11 +399,11 @@ def perform(c, manual):
             finish(rid,'waiting',f'新增/修改 {total/GIB:.3f} GiB，未达到 {c["threshold_gib"]} GiB；手动备份可立即打包'); return
         target=max(1,int(float(c.get('package_gib',5))))*GIB
         groups=list(batches(items,target)); event(rid,f'按日期从旧到新：{len(items)} 个文件，{total/GIB:.2f} GiB，预计 {len(groups)} 个独立 ZIP；每包至少 {target/GIB:.0f} GiB，单文件不可拆，最后一包可不足目标')
-        set_progress(rid,total_bytes=total,completed_bytes=0,current_bytes=0,sent_bytes=0,package_index=0,package_count=len(groups),threshold_bytes=target)
+        set_progress(rid,total_bytes=pre_completed+total,completed_bytes=pre_completed,current_bytes=0,current_source_bytes=0,archive_bytes=0,sent_bytes=0,package_index=0,package_count=len(groups),threshold_bytes=target)
         index=0; package_no=1
         while index<len(groups):
             check_cancel(); batch=groups[index]; size=sum(x['size'] for x in batch)
-            set_progress(rid,package_index=package_no,current_bytes=size,sent_bytes=0)
+            set_progress(rid,package_index=package_no,current_bytes=size,current_source_bytes=size,archive_bytes=0,sent_bytes=0)
             if shutil.disk_usage(STORE).free<size*1.02+64*BLOCK: raise ValueError('归档目录剩余空间不足，已完成的包保留')
             name=f'{"full" if full else "incremental"}-{datetime.now():%Y%m%d-%H%M%S}-{package_no:04d}-{secrets.token_hex(3)}.zip'
             path=os.path.join(STORE,name)
@@ -382,13 +414,13 @@ def perform(c, manual):
                 os.remove(path); index+=1; batch.extend(groups[index]); size=sum(x['size'] for x in batch)
                 with db() as con: con.execute('update run_progress set package_count=package_count-1 where run_id=?',(rid,))
                 event(rid,f'压缩后 ZIP 只有 {archive_size/GIB:.3f} GiB，未达到 5 GiB；合并下一批文件后重打，保证非末包 ZIP 不低于目标')
-                set_progress(rid,current_bytes=size)
+                set_progress(rid,current_bytes=size,current_source_bytes=size,archive_bytes=0)
                 if shutil.disk_usage(STORE).free<size*1.02+64*BLOCK: raise ValueError('合并批次后归档目录剩余空间不足，已完成的包保留')
                 hashes=make_zip(batch,path,c['encryption_password'],rid,package_no); archive_size=os.path.getsize(path)
-            set_progress(rid,current_bytes=archive_size,sent_bytes=0)
+            set_progress(rid,current_bytes=archive_size,current_source_bytes=size,archive_bytes=archive_size,sent_bytes=0)
             if archive_size<target and index==len(groups)-1:
                 event(rid,f'末包 ZIP 为 {archive_size/GIB:.3f} GiB，距 5 GiB 还差 {(target-archive_size)/GIB:.3f} GiB；剩余文件已全部封入独立末包')
-            pending=dict(name=name,hashes=hashes,files={x['rel']:x['sig'] for x in batch},items=[{'size':x['size']} for x in batch],items_by_rel={x['rel']:x['size'] for x in batch}); state['pending']=pending; atomic_json(sp,state)
+            pending=dict(name=name,hashes=hashes,files={x['rel']:x['sig'] for x in batch},items=[{'size':x['size']} for x in batch],items_by_rel={x['rel']:x['size'] for x in batch},archive_size=archive_size); state['pending']=pending; atomic_json(sp,state)
             with db() as con: con.execute('update runs set archive=? where id=?',(name,rid))
             upload(c,path,rid); commit_package(state,sp,pending,c,rid)
             event(rid,f'第 {package_no}/{len(groups)} 个独立 ZIP 已校验并上传：{name}；ZIP 大小 {archive_size/GIB:.3f} GiB')
@@ -487,9 +519,9 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path=='/run': start(True)
             elif self.path=='/delete-completed':
                 if not gate.acquire(blocking=False): raise ValueError('请先等当前任务完成，再删除已完成包')
-                try: deleted=delete_completed(load(),q.get('names',[]))
+                try: deleted,warnings=delete_completed(load(),q.get('names',[]))
                 finally: gate.release()
-                self.reply(200,dict(ok=True,deleted=deleted)); return
+                self.reply(200,dict(ok=True,deleted=deleted,warnings=warnings)); return
             elif self.path=='/stop':
                 cancel.set()
                 with network_lock:
