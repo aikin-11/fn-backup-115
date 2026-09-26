@@ -46,6 +46,19 @@ def db():
 
 def now(): return datetime.now().isoformat(timespec='seconds')
 
+def package_kind(name):
+    # Keep recognizing archives written by older releases, whose kind was a prefix.
+    return 'full' if name.startswith('full-') or '-full-' in name else 'incremental'
+
+def archive_filename(kind, stamp, run_id, package_no, nonce):
+    # Timestamp and monotonic run/package numbers sort chronologically as plain text.
+    return f'{stamp:%Y%m%d-%H%M%S}-{run_id:08d}-{kind}-{package_no:04d}-{nonce}.zip'
+
+def latest_events(limit=100):
+    with db() as con:
+        return [dict(r) for r in con.execute('select * from events order by id desc limit ?', (limit,))]
+
+
 def init():
     with db() as c:
         c.execute('create table if not exists runs(id integer primary key, started text, finished text, status text, message text, archive text, kind text)')
@@ -273,7 +286,7 @@ def commit_package(state, sp, pending, c, rid=None):
     state['packages'].append(dict(name=pending['name'],completed=now(),count=len(pending['files']),files=pending['files']))
     path=os.path.join(STORE,pending['name']); size=os.path.getsize(path) if os.path.exists(path) else int(pending.get('archive_size',0))
     with db() as con:
-        con.execute('insert or ignore into uploaded_packages(name,completed,size,source,remote_path,run_id,kind,item_count,remote_url,state_file) values(?,?,?,?,?,?,?,?,?,?)',(pending['name'],now(),size,c['source'],c['remote_path'],rid,'full' if pending['name'].startswith('full-') else 'incremental',len(pending['files']),c['remote_url'],sp))
+        con.execute('insert or ignore into uploaded_packages(name,completed,size,source,remote_path,run_id,kind,item_count,remote_url,state_file) values(?,?,?,?,?,?,?,?,?,?)',(pending['name'],now(),size,c['source'],c['remote_path'],rid,package_kind(pending['name']),len(pending['files']),c['remote_url'],sp))
         completed=now(); con.execute('insert or ignore into upload_events(name,day,uploaded_at,size) values(?,?,?,?)',(pending['name'],completed[:10],completed,size))
         con.executemany('insert or ignore into package_files(name,rel,sig,size) values(?,?,?,?)',[(pending['name'],rel,sig,int(pending.get('items_by_rel',{}).get(rel,0))) for rel,sig in pending['files'].items()])
     state.pop('pending',None); atomic_json(sp,state)
@@ -305,7 +318,7 @@ def sync_state_packages(c):
             size=os.path.getsize(local) if os.path.isfile(local) else 0
             # Keep inventory sync compatible with old SQLite builds and schema
             # migrations: insert then fill missing metadata, without UPSERT.
-            con.execute('insert or ignore into uploaded_packages(name,completed,size,source,remote_path,kind,item_count,remote_url,state_file) values(?,?,?,?,?,?,?,?,?)',(name,item.get('completed',''),size,c['source'],c['remote_path'],'full' if name.startswith('full-') else 'incremental',item.get('count',0),c['remote_url'],sp))
+            con.execute('insert or ignore into uploaded_packages(name,completed,size,source,remote_path,kind,item_count,remote_url,state_file) values(?,?,?,?,?,?,?,?,?)',(name,item.get('completed',''),size,c['source'],c['remote_path'],'full' if package_kind(name)=='full' else 'incremental',item.get('count',0),c['remote_url'],sp))
             con.execute('update uploaded_packages set size=case when size=0 then ? else size end,remote_url=case when coalesce(remote_url,\'\')=\'\' then ? else remote_url end,state_file=coalesce(state_file,?) where name=?',(size,c['remote_url'],sp,name))
             if item.get('completed'):
                 completed=item['completed']; con.execute('insert into upload_events(name,day,uploaded_at,size) values(?,?,?,?) on conflict(name) do update set size=case when upload_events.size=0 then excluded.size else upload_events.size end',(name,completed[:10],completed,size))
@@ -408,7 +421,7 @@ def perform(c, manual):
             check_cancel(); batch=groups[index]; size=sum(x['size'] for x in batch)
             set_progress(rid,package_index=package_no,current_bytes=size,current_source_bytes=size,archive_bytes=0,sent_bytes=0)
             if shutil.disk_usage(STORE).free<size*1.02+64*BLOCK: raise ValueError('归档目录剩余空间不足，已完成的包保留')
-            name=f'{"full" if full else "incremental"}-{datetime.now():%Y%m%d-%H%M%S}-{package_no:04d}-{secrets.token_hex(3)}.zip'
+            name=archive_filename('full' if full else 'incremental',archive_stamp,rid,package_no,secrets.token_hex(3))
             path=os.path.join(STORE,name)
             event(rid,f'第 {package_no}/{len(groups)} 包：{datetime.fromtimestamp(batch[0]["time"]):%Y-%m-%d} 至 {datetime.fromtimestamp(batch[-1]["time"]):%Y-%m-%d}；源数据 {size/GIB:.3f} GiB')
             hashes=make_zip(batch,path,c['encryption_password'],rid,package_no)
@@ -489,7 +502,7 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path=='/progress':
                 with db() as c:
                     rows=[dict(r) for r in c.execute('select * from runs order by id desc limit 30')]
-                    logs=[dict(r) for r in c.execute('select * from events order by id desc limit 100')][::-1]
+                    logs=latest_events()
                     progress={r['run_id']:dict(r) for r in c.execute('select * from run_progress')}
                 for row in rows: row['progress']=progress.get(row['id'],{})
                 sync_state_packages(load())
