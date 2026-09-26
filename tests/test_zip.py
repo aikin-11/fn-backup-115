@@ -56,6 +56,35 @@ class BackupTests(unittest.TestCase):
             amount=con.execute('select sum(size) from observed').fetchone()[0]
         self.assertEqual((count,amount),(1,123))
 
+    def test_completed_package_keeps_final_gap_progress_and_daily_upload_total(self):
+        name='full-test-final.zip'; archive=root/'archives'/name; archive.write_bytes(b'zip-data')
+        state_path=root/'config'/'state-test.json'; state={'files':{},'packages':[]}
+        app.atomic_json(str(state_path),state)
+        c={**app.DEFAULT,'source':str(root/'source'),'remote_url':'http://localhost','remote_path':'/115/backup','keep_local':True}
+        app.set_progress(self.rid,total_bytes=100,completed_bytes=0,package_index=1,package_count=1,threshold_bytes=5*app.GIB)
+        pending={'name':name,'files':{'one.jpg':'1:2:3'},'items':[{'size':100}],
+                 'items_by_rel':{'one.jpg':100},'archive_size':len(b'zip-data'),
+                 'hashes':{'one.jpg':{'size':100}}}
+        app.commit_package(state,str(state_path),pending,c,self.rid)
+        with app.db() as con:
+            progress=con.execute('select * from run_progress where run_id=?',(self.rid,)).fetchone()
+            uploaded=con.execute('select count(*) from upload_events where name=?',(name,)).fetchone()[0]
+            con.execute('delete from uploaded_packages where name=?',(name,))
+        self.assertEqual(progress['archive_bytes'],len(b'zip-data'))
+        self.assertEqual(progress['sent_bytes'],len(b'zip-data'))
+        self.assertEqual(uploaded,1)
+        self.assertTrue(any(row['uploaded']==len(b'zip-data') for row in app.package_metrics()[0]))
+
+    def test_forgetting_one_package_preserves_other_file_signatures(self):
+        state_path=root/'config'/'state-delete.json'
+        state={'files':{'a.jpg':'sig-a','b.jpg':'sig-b'},'baseline_complete':True,
+               'packages':[{'name':'a.zip','files':{'a.jpg':'sig-a'}},{'name':'b.zip','files':{'b.jpg':'sig-b'}}]}
+        app.atomic_json(str(state_path),state)
+        app.forget_state_package(str(state_path),'a.zip',app.DEFAULT)
+        saved=json.loads(state_path.read_text())
+        self.assertEqual(saved['files'],{'b.jpg':'sig-b'})
+        self.assertEqual([p['name'] for p in saved['packages']],['b.zip'])
+
     def test_exif_precedence_oldest_first(self):
         folder=root/'source'/'dates';folder.mkdir(exist_ok=True)
         for name,date in [('a-new.jpg','2025:01:01 00:00:00'),('z-old.jpg','2001:01:01 00:00:00')]:
