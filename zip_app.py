@@ -275,7 +275,7 @@ def commit_package(state, sp, pending, c, rid=None):
 def package_metrics():
     with db() as con:
         daily=[dict(r) for r in con.execute('select d.day,coalesce(o.added,0) added,coalesce(u.uploaded,0) uploaded from (select day from observed union select substr(completed,1,10) day from uploaded_packages) d left join (select day,sum(size) added from observed group by day) o on o.day=d.day left join (select substr(completed,1,10) day,sum(size) uploaded from uploaded_packages group by substr(completed,1,10)) u on u.day=d.day order by d.day desc limit 370')]
-        packages=[dict(r) for r in con.execute('select name,completed,size,kind,item_count,remote_path from uploaded_packages order by completed desc limit 500')]
+        packages=[dict(r) for r in con.execute('select name,completed,size,kind,item_count,remote_path from uploaded_packages order by completed desc limit 2000')]
     return daily,packages
 
 def sync_state_packages(c):
@@ -291,7 +291,7 @@ def sync_state_packages(c):
             con.executemany('insert or ignore into package_files(name,rel,sig,size) values(?,?,?,?)',[(item.get('name',''),rel,sig,0) for rel,sig in item.get('files',{}).items()])
 
 def delete_completed(c,names):
-    if not names or len(names)>1000 or len(set(names))!=len(names): raise ValueError('请选择要删除的已完成 ZIP')
+    if not names or len(names)>2000 or len(set(names))!=len(names): raise ValueError('请选择要删除的已完成 ZIP（最多 2000 个）')
     u=urllib.parse.urlsplit(c['remote_url'].rstrip('/')); dav_root=u.path.rstrip('/')
     if not dav_root.endswith('/dav'): dav_root+='/dav'
     conn=(http.client.HTTPSConnection if u.scheme=='https' else http.client.HTTPConnection)(u.hostname,u.port,timeout=60)
