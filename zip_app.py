@@ -303,7 +303,10 @@ def sync_state_packages(c):
             if not name or con.execute('select 1 from deleted_packages where name=?',(name,)).fetchone(): continue
             local=os.path.join(STORE,item.get('name',''))
             size=os.path.getsize(local) if os.path.isfile(local) else 0
-            con.execute('insert into uploaded_packages(name,completed,size,source,remote_path,kind,item_count,remote_url,state_file) values(?,?,?,?,?,?,?,?,?) on conflict(name) do update set size=case when uploaded_packages.size=0 then excluded.size else uploaded_packages.size end,remote_url=coalesce(nullif(uploaded_packages.remote_url,''),excluded.remote_url),state_file=coalesce(uploaded_packages.state_file,excluded.state_file)',(name,item.get('completed',''),size,c['source'],c['remote_path'],'full' if name.startswith('full-') else 'incremental',item.get('count',0),c['remote_url'],sp))
+            # Keep inventory sync compatible with old SQLite builds and schema
+            # migrations: insert then fill missing metadata, without UPSERT.
+            con.execute('insert or ignore into uploaded_packages(name,completed,size,source,remote_path,kind,item_count,remote_url,state_file) values(?,?,?,?,?,?,?,?,?)',(name,item.get('completed',''),size,c['source'],c['remote_path'],'full' if name.startswith('full-') else 'incremental',item.get('count',0),c['remote_url'],sp))
+            con.execute('update uploaded_packages set size=case when size=0 then ? else size end,remote_url=case when coalesce(remote_url,\'\')=\'\' then ? else remote_url end,state_file=coalesce(state_file,?) where name=?',(size,c['remote_url'],sp,name))
             if item.get('completed'):
                 completed=item['completed']; con.execute('insert into upload_events(name,day,uploaded_at,size) values(?,?,?,?) on conflict(name) do update set size=case when upload_events.size=0 then excluded.size else upload_events.size end',(name,completed[:10],completed,size))
             con.executemany('insert or ignore into package_files(name,rel,sig,size) values(?,?,?,?)',[(name,rel,sig,0) for rel,sig in item.get('files',{}).items()])
