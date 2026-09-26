@@ -16,12 +16,22 @@ Web 页面选择 NAS 源目录，通过 OpenList WebDAV 上传到 115。端口 `
 - 失败保留已验证的 ZIP，重试使用同一文件名。只有 WebDAV 返回成功后才提交该包的文件状态；重启后会继续未完成的首轮。
 - 分阶段日志：扫描、压缩加密、完整解密校验、发送至 OpenList、等待 OpenList/115 确认、成功。发送 100% 不是云端成功，等待阶段持续显示耗时。
 
-## Compose 部署
+## 在 1Panel 终端干净部署
 
 ```bash
-cd /你的项目目录
+set -e
+APP_DIR="/vol1/1000/存储空间1/docker/fn-backup-115"
+mkdir -p "$APP_DIR"
+cd "$APP_DIR"
+curl -fL "https://codeload.github.com/aikin-11/fn-backup-115/zip/refs/heads/main" -o fn-backup-115.zip
+unzip -oq fn-backup-115.zip
+cd fn-backup-115-main
 docker compose up -d --build
 ```
+
+如旧容器仍占用名称 `fn-backup-115`，先在 1Panel 等它停止后删除**容器本身**，再执行上面的命令；不要选择删除数据卷/宿主机目录。新项目代码放在独立目录，旧版配置和 ZIP 数据仍挂载原位置。
+
+Docker 镜像只复制 `zip_app.py`、`web.html` 和 Python 依赖，不再携带旧版 `app.py`、测试或其他项目。容器内 `/progress` 提供健康检查，Docker 日志每个文件最多 10 MiB、保留 3 份；完整任务日志仍在网页和数据库。
 
 本仓库 Compose 按当前 NAS 配置：
 
