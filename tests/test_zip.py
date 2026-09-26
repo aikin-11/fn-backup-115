@@ -44,6 +44,18 @@ class BackupTests(unittest.TestCase):
         groups=list(app.batches([dict(size=s) for s in [6,4,11,2,3]],10))
         self.assertEqual([[x['size'] for x in g] for g in groups],[[6,4],[11],[2,3]])
 
+    def test_five_gib_batches_accumulate_to_minimum_and_leave_tail(self):
+        groups=list(app.batches([dict(size=s) for s in [3,3,4,2]],5))
+        self.assertEqual([[x['size'] for x in g] for g in groups],[[3,3],[4,2]])
+
+    def test_daily_observation_deduplicates_repeated_scan(self):
+        item=dict(rel='one.jpg',sig='1:2:3',size=123)
+        app.record_observed([item]); app.record_observed([item])
+        with app.db() as con:
+            count=con.execute('select count(*) from observed').fetchone()[0]
+            amount=con.execute('select sum(size) from observed').fetchone()[0]
+        self.assertEqual((count,amount),(1,123))
+
     def test_exif_precedence_oldest_first(self):
         folder=root/'source'/'dates';folder.mkdir(exist_ok=True)
         for name,date in [('a-new.jpg','2025:01:01 00:00:00'),('z-old.jpg','2001:01:01 00:00:00')]:
