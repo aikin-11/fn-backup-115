@@ -20,7 +20,7 @@ Web 页面选择 NAS 源目录，通过 OpenList WebDAV 上传到 115。端口 `
 
 ```bash
 set -e
-APP_DIR="/vol1/1000/存储空间1/docker/fn-backup-115"
+APP_DIR="/vol1/1000/存储空间1/docker/115/deploy-zip"
 mkdir -p "$APP_DIR"
 cd "$APP_DIR"
 curl -fL "https://codeload.github.com/aikin-11/fn-backup-115/zip/refs/heads/main" -o fn-backup-115.zip
