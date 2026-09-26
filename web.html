@@ -23,7 +23,7 @@ body{font:15px system-ui;background:#f3f6fa;color:#182638;margin:0}main{max-widt
 <button type="submit">保存并验证密码</button><button type="button" id="run">立即备份已保存目录</button><button type="button" id="stop" class="danger">停止当前任务</button>
 </form>
 <details><summary>检查是否记得已保存的 ZIP 密码</summary><label>重新输入密码<input id="rememberPassword" type="password" autocomplete="off"></label><button id="verify" class="secondary">验证密码</button></details>
-<h2>实时进度</h2><div id="live">待运行</div><div class="meter"><i id="overall"></i></div><p id="overallText"></p><h2>每日新增与上传热力图</h2><p>色块按当天新增/变更数据量着色；悬停查看新增量与上传量。</p><div class="heatmap" id="heatmap"></div><h2>今日统计</h2><div class="stats" id="todayStats">读取中…</div><h2>任务日志</h2><pre id="logs">暂无日志</pre>
+<h2>实时进度</h2><div id="live">待运行</div><div class="meter"><i id="overall"></i></div><p id="overallText"></p><h2>每日新增与上传热力图</h2><p>色块按当天新增/变更数据量着色；悬停查看新增量与上传量。颜色由浅到深表示新增量由少到多。</p><div class="heatmap" id="heatmap"></div><h2>今日统计</h2><div class="stats" id="todayStats">读取中…</div><h2>任务日志</h2><pre id="logs">暂无日志</pre>
 <h2>最近任务</h2><button id="clear" class="secondary">清空任务记录（保留备份文件）</button><table><thead><tr><th>开始</th><th>状态</th><th>信息</th><th>归档</th></tr></thead><tbody id="runs"></tbody></table>
 <h2>已上传至 115 的独立 ZIP</h2><p>仅列出服务端确认成功的 ZIP。勾选后可删除对应 115 文件和本地 ZIP；删除任务记录不会自动删文件。</p><div class="package-actions"><button id="selectAll" class="secondary">全选</button><button id="deletePackages" class="danger">删除所选已完成包</button><span id="packageCount"></span></div><table><thead><tr><th>选择</th><th>包名</th><th>上传时间</th><th>大小</th><th>类型</th><th>文件数</th><th>115目录</th></tr></thead><tbody id="packages"></tbody></table>
 <p>恢复：单独下载任意 .zip，使用 7-Zip 等支持 AES ZIP 的软件解压。完整恢复需收集全部成功的全量和增量 ZIP，按包名时间从旧到新解压到一个空目录；新版本覆盖旧版本。此备份不传播源目录的删除操作。</p>
