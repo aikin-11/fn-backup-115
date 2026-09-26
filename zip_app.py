@@ -304,16 +304,19 @@ def delete_completed(c,names):
             if name not in rows or os.path.basename(name)!=name or not name.endswith('.zip'): raise ValueError('只能删除已确认上传成功的 ZIP：'+str(name))
         if any(not file_map.get(n) for n in names) and set(names)!=set(rows): raise ValueError('旧版已完成包没有逐包文件清单。为避免删除后漏备份，只能一次选中并删除全部已完成包，重置全量清单。')
         deleted=[]
-        for name in names:
-            row=rows[name]; remote=row['remote_path'].strip('/')
-            target=urllib.parse.quote(dav_root+'/'+remote+'/'+name,safe='/')
-            conn.request('DELETE',target,headers=headers); response=conn.getresponse(); response.read()
-            if response.status not in (200,202,204,404): raise RuntimeError(f'{name} 删除失败：HTTP {response.status} {response.reason}')
-            deleted.append(name)
-            with db() as con:
-                con.execute('delete from package_files where name=?',(name,)); con.execute('delete from uploaded_packages where name=?',(name,))
-            local=os.path.join(STORE,name)
-            if os.path.isfile(local): os.remove(local)
+        try:
+            for name in names:
+                row=rows[name]; remote=row['remote_path'].strip('/')
+                target=urllib.parse.quote(dav_root+'/'+remote+'/'+name,safe='/')
+                conn.request('DELETE',target,headers=headers); response=conn.getresponse(); response.read()
+                if response.status not in (200,202,204,404): raise RuntimeError(f'{name} 删除失败：HTTP {response.status} {response.reason}')
+                deleted.append(name)
+                with db() as con:
+                    con.execute('delete from package_files where name=?',(name,)); con.execute('delete from uploaded_packages where name=?',(name,))
+                local=os.path.join(STORE,name)
+                if os.path.isfile(local): os.remove(local)
+        except http.client.HTTPException as exc:
+            raise RuntimeError(f'删除 115 文件时 WebDAV 连接异常；已成功删除 {len(deleted)} 个包') from exc
         run_ids={rows[n]['run_id'] for n in names if rows[n].get('run_id')}
         with db() as con:
             for rid in run_ids:
