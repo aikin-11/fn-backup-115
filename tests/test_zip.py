@@ -85,6 +85,17 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(saved['files'],{'b.jpg':'sig-b'})
         self.assertEqual([p['name'] for p in saved['packages']],['b.zip'])
 
+    def test_inventory_sync_is_idempotent_for_legacy_sqlite_rows(self):
+        c={**app.DEFAULT,'source':str(root/'source'),'remote_url':'http://localhost','remote_path':'/115/backup'}
+        sp=app.state_path(c)
+        app.atomic_json(sp,{'files':{},'packages':[{'name':'full-legacy.zip','completed':'2026-09-26T10:00:00','count':1,'files':{'old.jpg':'sig'}}]})
+        app.sync_state_packages(c);app.sync_state_packages(c)
+        with app.db() as con:
+            rows=con.execute("select name,remote_url,state_file from uploaded_packages where name='full-legacy.zip'").fetchall()
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['remote_url'],c['remote_url'])
+        self.assertEqual(rows[0]['state_file'],sp)
+
     def test_exif_precedence_oldest_first(self):
         folder=root/'source'/'dates';folder.mkdir(exist_ok=True)
         for name,date in [('a-new.jpg','2025:01:01 00:00:00'),('z-old.jpg','2001:01:01 00:00:00')]:
